@@ -1,0 +1,1 @@
+build/boot/boot.o: boot/boot.S
