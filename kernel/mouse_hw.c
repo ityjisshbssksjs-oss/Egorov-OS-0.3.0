@@ -83,6 +83,7 @@
 #include "io.h"
 #include "string.h"
 #include "timer.h"   /* F3: kdelay_us — калиброванная PIT-задержка */
+#include "usbdump.h" /* [#494] МЕГА-ЛОГ: дескрипторы/биты портов/строки */
 
 /* [#415] карта UHCI: владельцы портов (драйверы UHCI живут в других файлах) */
 extern uint16_t usb_mouse_uhci_io(void);    /* usb_mouse.c: I/O-база мыши */
@@ -305,6 +306,7 @@ static const char *spd_name(uint32_t sv) {
 
 /* ── Static memory (BSS, физически ниже 4 ГБ — DMA совместимо) ────────────── */
 #define XHCI_NINST 4   /* [#455] Г8: AMD/Intel платформы дают до 4 xHCI */
+#define XHCI_SLOT_MAX 256 /* xHCI Slot ID is 8-bit: valid array indexes 0..255 */
 #define OHCI_NINST 4   /* [#415] AMD FCH: до 4-5 OHCI-компаньонов — порты гнёзд 6-7 невидимы */
 static int g_xi;                    /* индекс ТЕКУЩЕГО xHCI-контроллера */
 static int g_ms_xi = -1;            /* инстанс-владелец мыши (-1 = мыши нет) */
@@ -319,7 +321,7 @@ static int g_kb_xi = -1;            /* инстанс-владелец клав�
 static uint64_t hw_dcbaa_a[XHCI_NINST][512]  __attribute__((aligned(4096)));
 static mhw_trb_t hw_cmd_a[XHCI_NINST][16]    __attribute__((aligned(64)));
 static mhw_trb_t hw_evt_a[XHCI_NINST][16]    __attribute__((aligned(64)));
-static mhw_trb_t hw_ep0_a[XHCI_NINST][8]     __attribute__((aligned(64)));
+static mhw_trb_t hw_ep0_a[XHCI_NINST][XHCI_SLOT_MAX][8] __attribute__((aligned(64)));
 static mhw_trb_t hw_ep1_a[XHCI_NINST][8]     __attribute__((aligned(64)));
 static uint64_t  hw_erst_a[XHCI_NINST][8]    __attribute__((aligned(64)));
 /* F3: каждый scratchpad-буфер обязан быть выровнен на 4К (спека xHCI
@@ -337,7 +339,7 @@ static uint64_t  hw_sparr_a[XHCI_NINST][32]  __attribute__((aligned(64)));
 #define hw_dcbaa   (hw_dcbaa_a[g_xi])
 #define hw_cmd     (hw_cmd_a[g_xi])
 #define hw_evt     (hw_evt_a[g_xi])
-#define hw_ep0     (hw_ep0_a[g_xi])
+#define hw_ep0     (hw_ep0_a[g_xi][g_eslot])
 #define hw_ep1     (hw_ep1_a[g_xi])
 #define hw_erst    (hw_erst_a[g_xi])
 #define hw_scratch (hw_scratch_a[g_xi])
@@ -394,11 +396,12 @@ typedef struct { mhw_trb_t *t; int n; int idx; int cyc; } mhw_ring_t;
  * писал r_kbd_ep1[2]/[3] мимо КАЖДУЮ загрузку (даже на 1-2
  * контроллерах) — вероятный источник «мусора 0x32 в OHCI-статиках»,
  * который ловил старый СНИМОК. */
-static mhw_ring_t g_r_cmd[XHCI_NINST], g_r_ep0[XHCI_NINST],
+static mhw_ring_t g_r_cmd[XHCI_NINST],
+                  g_r_ep0[XHCI_NINST][XHCI_SLOT_MAX],
                   g_r_ep1[XHCI_NINST], g_r_kbd_ep1[XHCI_NINST],
                   g_r_msd_o[XHCI_NINST], g_r_msd_i[XHCI_NINST];
 #define r_cmd     (g_r_cmd[g_xi])
-#define r_ep0     (g_r_ep0[g_xi])
+#define r_ep0     (g_r_ep0[g_xi][g_eslot])
 #define r_ep1     (g_r_ep1[g_xi])
 #define r_kbd_ep1 (g_r_kbd_ep1[g_xi])
 #define r_msd_o   (g_r_msd_o[g_xi])
@@ -1043,9 +1046,15 @@ static bool     g_ctrl_quiet;   /* молчать в ctrl_xfer (STALL мыши -
 static uint8_t  g_oh_amb_iface, g_oh_amb_ep, g_oh_amb_mps, g_oh_amb_sub;
 static uint16_t g_log_max;
 static uint32_t g_packets, g_errors;
+static uint32_t g_mouse_activity_logs; /* первые реальные движения/клики */
+static uint32_t g_kbd_transition_logs; /* первые HID make/break события */
 static int      g_fb_w, g_fb_h;
 static mouse_state_t g_mouse;
 static bool     prev_left, prev_right;
+/* События мыши могут прийти, пока синхронная USB-команда ждёт своё
+ * завершение. Не теряем их, даже если это произошло до mouse_hw_poll(). */
+static bool     g_mouse_polling;
+static bool     g_pending_mouse_moved, g_pending_mouse_left, g_pending_mouse_right;
 
 /* ══ [#474] ЭТАП 10: СНИМКИ КОНФИГУРАЦИИ ЖИВЫХ СЛОТОВ ══════════════════
  *
@@ -1126,6 +1135,11 @@ static uint8_t lk_oh_mps(void)   { return g_lk.valid ? g_lk.oh_mps   : g_oh_kbd_
  * привязки/отключения клавиатуры выше по файлу. */
 static void zl_note(const char *what);
 static void oh_kbd_state_reset(void);
+/* Синхронные ожидания команд и USB Mass Storage разделяют event ring с
+ * постоянно работающими HID endpoint'ами. Чужие live Transfer Events
+ * надо обработать, а не выбрасывать. Определена ниже oh_kbd_process(). */
+static bool hw_route_live_xhci_event(uint32_t type, uint64_t p,
+                                      uint32_t st, uint32_t ctl);
 /* [LOGS] ЭТАП 11: xHCI MSD — определены ниже (после OHCI-варианта),
  * а вызываются из hw_enumerate выше. */
 static bool xm_dev_probe(const uint8_t *cfg, uint16_t total, uint32_t speed);
@@ -1207,7 +1221,12 @@ static bool wait_cmd(uint32_t trb_phys, uint32_t *ccode, uint32_t *slot_out) {
                 *slot_out = ctl >> 24;
                 return (*ccode == CC_SUCCESS);
             }
-            /* прочие события — пропустить */
+            /* Пока ждём Command Completion, контроллер всё равно может
+             * завершить IN-отчёт уже работающей мыши/клавиатуры. ERDP
+             * продвигается только вперёд: если здесь выбросить событие,
+             * обычный poll его никогда не увидит и endpoint останется
+             * без повторно поставленного TRB. */
+            (void)hw_route_live_xhci_event(type, p, st, ctl);
         }
         if (timeout-- <= 0) { *ccode = 0; *slot_out = 0; return false; }
         hw_delay(1000);
@@ -1246,7 +1265,11 @@ static bool ctrl_xfer(uint8_t bm, uint8_t bReq, uint16_t wVal, uint16_t wIdx,
         uint64_t p; uint32_t st, ctl;
         while (evt_get(&p, &st, &ctl)) {
             uint32_t type = (ctl >> 10) & 0x3Fu;
-            if (type == TRB_EV_TRANSFER && (ctl >> 24) == (uint32_t)g_eslot) {
+            /* EP ID 1 = control endpoint 0. Одного совпадения slot ID
+             * недостаточно: у составного устройства interrupt-IN имеет
+             * тот же slot, но это НЕ завершение EP0. */
+            if (type == TRB_EV_TRANSFER && (ctl >> 24) == (uint32_t)g_eslot &&
+                ((ctl >> 16) & 0x1Fu) == 1u) {
                 uint32_t cc = st >> 24;
                 if (cc != CC_SUCCESS && cc != CC_SHORT_PACKET) {
                     if (!g_ctrl_quiet) {   /* STALL от LED-пробы - не ошибка */
@@ -1258,6 +1281,9 @@ static bool ctrl_xfer(uint8_t bm, uint8_t bReq, uint16_t wVal, uint16_t wIdx,
                 }
                 return true;
             }
+            /* Не выбрасывать завершения живых interrupt-IN endpoint'ов,
+             * пока ожидаем результат EP0. */
+            (void)hw_route_live_xhci_event(type, p, st, ctl);
         }
         if (timeout-- <= 0) {
             serial_puts("MOUSEHW: ctrl timeout\n");
@@ -1322,6 +1348,18 @@ static void hw_move_to(int nx, int ny) {
     g_mouse.y = ny;
 }
 
+static void hw_trace_mouse_data(int dx, int dy, uint8_t btn) {
+    if ((!dx && !dy && !btn) || g_mouse_activity_logs >= 8u) return;
+    g_mouse_activity_logs++;
+    serial_puts("MOUSEHW: HID mouse input dx=");
+    serial_puthex((uint32_t)dx);
+    serial_puts(" dy=");
+    serial_puthex((uint32_t)dy);
+    serial_puts(" buttons=");
+    serial_puthex(btn);
+    serial_puts("\n");
+}
+
 static void hw_apply_buttons(uint8_t btn) {
     bool nl = (btn & 1) != 0;
     bool nr = (btn & 2) != 0;
@@ -1341,6 +1379,7 @@ static void hw_boot_report(const uint8_t *p, int act) {
     if (dx < -48) dx = -48;
     if (dy >  48) dy =  48;
     if (dy < -48) dy = -48;
+    hw_trace_mouse_data(dx, dy, p[0]);
     hw_move_to(g_mouse.x + dx, g_mouse.y + dy);   /* USB: +dy = вниз по экрану */
     hw_apply_buttons(p[0]);
 }
@@ -1484,6 +1523,7 @@ static void hw_hid_report(const uint8_t *p, int act) {
     if (dx < -48) dx = -48;
     if (dy >  48) dy =  48;
     if (dy < -48) dy = -48;
+    hw_trace_mouse_data(dx, dy, p[base]);
     hw_move_to(g_mouse.x + dx, g_mouse.y + dy); /* +dy = вниз, как и было   */
     hw_apply_buttons(p[base]);
 }
@@ -2093,6 +2133,46 @@ static bool hw_bind_kbd(uint8_t cfgval) {
     return true;
 }
 
+/* [#494] СТРОКИ устройства (xHCI-путь): язык → производитель/продукт/
+ * серийник. ВАЖНО: вызывается ТОЛЬКО ПОСЛЕ ПОЛНОГО перечисления
+ * (бинд+arm) — STALL строкового запроса (QEMU usb-девайсы) останавливает
+ * EP0 без RESET_ENDPOINT в этом драйвере: во время перечисления это
+ * убивало устройство (e2e T6: cc=6 Stall → ctrl timeout → бинда нет),
+ * а после бинда EP0 для boot-HID уже не нужен (данные идут по EP1).
+ * Первый неудавшийся запрос — стоп (дальше не спрашиваем). */
+static void hw_dump_strings(const char *wl, const uint8_t *dd) {
+    uint8_t sb[64];
+    memset(sb, 0, sizeof(sb));
+    if (!ctrl_xfer(0x80, 0x06, 0x0300u, 0, 4, sb)) {
+        serial_puts("USB-STR: ["); serial_puts(wl);
+        serial_puts("] язык не прочитан - строки пропускаю (норма)\n");
+        return;
+    }
+    uint16_t lang = (uint16_t)(sb[2] | ((uint16_t)sb[3] << 8));
+    static const char *names[3] = { "производитель", "продукт", "серийный №" };
+    uint8_t idxs[3];
+    idxs[0] = dd[14]; idxs[1] = dd[15]; idxs[2] = dd[16];
+    for (int i = 0; i < 3; i++) {
+        if (idxs[i] == 0) continue;
+        memset(sb, 0, sizeof(sb));
+        if (!ctrl_xfer(0x80, 0x06,
+                       (uint16_t)(0x0300u | (uint32_t)idxs[i]) /* [#496] wValue: тип<<8|индекс */,
+                       lang, 64, sb)) {
+            serial_puts("USB-STR: ["); serial_puts(wl); serial_puts("] ");
+            serial_puts(names[i]); serial_puts(" — нет строки (норма, дальше не спрашиваю)\n");
+            break;
+        }
+        serial_puts("USB-STR: ["); serial_puts(wl); serial_puts("] ");
+        serial_puts(names[i]); serial_puts(": ");
+        ud_str_desc(sb, 64);
+    }
+}
+
+/* [#494] сташ последнего прочитанного девайс-дескриптора: строки читаем
+ * ПОСЛЕ бинда (см. hw_dump_strings), а дескриптор локален hw_enumerate */
+static uint8_t g_last_dd[18];
+static uint8_t g_last_dd_port;   /* порт, которому принадлежит g_last_dd */
+
 /* ── Полное перечисление HID мыши на данном порту ─────────────────────────── */
 static bool hw_enumerate(uint8_t port, uint32_t speed) {
     g_xh_port  = port;                    /* трекинг для СНИМКА */
@@ -2102,15 +2182,10 @@ static bool hw_enumerate(uint8_t port, uint32_t speed) {
      * ПРЕДЫДУЩЕГО устройства (hotplug/замена) иначе масштабировал бы
      * оси нового; дефолт 32767 перепишет hw_parse_absolute при успехе. */
     g_log_max = 32767;
-    /* КАНОН Linux xhci-ring.c - enqueue-состояние кольца обязано
-     * совпадать с fresh dequeue контроллера (Address Device ставит EP0
-     * deque = hw_ep0[0], DCS=1).  Раньше r_ep0 продолжал с залежалой
-     * позиции и залежалым cycle-битом, поэтому ЛЮБОЕ ВТОРОЕ перечисление
-     * на контроллере (клава после мыши, hotplug) валилось по STALE TRB:
-     * «клава в 3.0 не работает», «не работает! ничего». */
-    for (int i = 0; i < 8; i++) hw_ep0[i].control = 0;
-    r_ep0.idx = 0;
-    r_ep0.cyc = 1;
+    /* EP0 ring не сбрасывается до Enable Slot: теперь у каждого slot ID
+     * своя очередь, и перечисление нового устройства не трогает EP0
+     * уже работающего устройства на этом же xHCI.
+     */
     xh_diag_set("enable slot (порт ");
     xh_diag_num(port);
     xh_diag_add(")");
@@ -2150,6 +2225,14 @@ static bool hw_enumerate(uint8_t port, uint32_t speed) {
         g_eslot = 0;
         return false;
     }
+    /* Каждый слот владеет своим EP0 transfer ring. Важно не переиспользовать
+     * общий ring: Address Device сохраняет dequeue pointer в контексте слота,
+     * и последующая инициализация другого устройства не должна менять его.
+     */
+    memset(hw_ep0, 0, sizeof(hw_ep0_a[g_xi][g_eslot]));
+    r_ep0.idx = 0;
+    r_ep0.cyc = 1;
+
     /* Выходной контекст слота — ДОЛЖЕН быть в DCBAA до Address Device:
      * QEMU/контроллер пишут и читают контексты по этому адресу. */
     hw_dcbaa[g_eslot] = (uint64_t)vphys(hw_devctx);
@@ -2238,6 +2321,24 @@ static bool hw_enumerate(uint8_t port, uint32_t speed) {
     uint16_t pid = (uint16_t)(dd[10] | ((uint16_t)dd[11] << 8));
     usb_db_report(vid, pid);   /* подбор драйвера в мини-базе */
 
+    /* [#494] МЕГА-ЛОГ: полный девайс-дескриптор + СТРОКИ производителя/
+     * продукта/серийника + метка времени. Печать только — перечислению
+     * не мешает (строки читаются уже по адресу, ошибки не фатальны). */
+    {
+        char wl[26]; int wn = 0;
+        { const char *s = "xHCI#"; while (*s) wl[wn++] = *s++; }
+        { char nb[8]; const char *s = itoa((uint32_t)(g_xi + 1), nb, 10);
+          while (*s && wn < 20) wl[wn++] = *s++; }
+        { const char *s = " порт "; while (*s && wn < 24) wl[wn++] = *s++; }
+        { char nb[8]; const char *s = itoa((uint32_t)port, nb, 10);
+          while (*s && wn < 25) wl[wn++] = *s++; }
+        wl[wn] = 0;
+        memcpy(g_last_dd, dd, 18);
+        g_last_dd_port = port;
+        ud_dev_desc(wl, dd, 18);
+        ud_ts("xHCI: дескрипторы прочитаны (см. выше)");
+    }
+
     /* 4. Evaluate Context: точный EP0 mps из bMaxPacketSize0 */
     memset(hw_inctx, 0, sizeof(hw_inctx));
     inctx_icc(ICC_SLOT | ICC_EP0);
@@ -2277,6 +2378,18 @@ static bool hw_enumerate(uint8_t port, uint32_t speed) {
         xh_diag_set("GET_DESCRIPTOR(CFG) не прошёл");
         hw_disable_slot();
         return false;
+    }
+    /* [#494] МЕГА-ЛОГ: конфиг-дескриптор целиком (интерфейсы/HID/эндпоинты) */
+    {
+        char wl[26]; int wn = 0;
+        { const char *s = "xHCI#"; while (*s) wl[wn++] = *s++; }
+        { char nb[8]; const char *s = itoa((uint32_t)(g_xi + 1), nb, 10);
+          while (*s && wn < 20) wl[wn++] = *s++; }
+        { const char *s = " порт "; while (*s && wn < 24) wl[wn++] = *s++; }
+        { char nb[8]; const char *s = itoa((uint32_t)port, nb, 10);
+          while (*s && wn < 25) wl[wn++] = *s++; }
+        wl[wn] = 0;
+        ud_cfg_desc(wl, cfg, total);
     }
 
     /* 6. «КТО ТЫ?» - классификация HID:
@@ -2753,12 +2866,19 @@ static int probe_xhci(int xi, uint8_t xbus, uint8_t xdev, uint8_t xfn,
 #define TD_DP_IN      (2u << 19)
 #define TD_DI_NOINT   (7u << 21)
 #define TD_DI_NOW     (0u << 21)
-/* по спеке OHCI T[25:24]: 00=carry от ED, 01=DATA0, 10=DATA1,
- * 11=reserved (Linux ohci.h: TD_T_DATA0=0x01000000, TD_T_DATA1=0x02000000).
- * Было 10/11 - SETUP уходил с DATA1, реальное устройство молчало
- * (cc=5 DeviceNotResponding, фото/); QEMU прощал. ИСПРАВЛЕНО. */
-#define TD_T_DATA0    (1u << 24)
-#define TD_T_DATA1    (2u << 24)
+/* [#498] РЕАЛЬНАЯ кодировка Linux ohci.h (torvalds/linux, сверено
+ * с QEMU hcd-ohci.c): T[25:24]: 00=carry от ED (TD_T_TOGGLE=0),
+ * 01=RESERVED, 10=DATA0 (0x02000000), 11=DATA1 (0x03000000).
+ * Пары 01/10 (жила с 0.3.1) была ОБРАТНОЙ трактовкой: SETUP уходил
+ * с зарезервированным 01b, DATA/STATUS - с DATA0 вместо DATA1.
+ * QEMU контрольные тогглы НЕ моделирует (e2e молчал), а реальный
+ * AMD FCH честно гонит бит на провод: устройство ACKает SETUP
+ * (01 трактован как carry), но игнорирует DATA-IN/STATUS-IN со
+ * сбитым тогглом -> cc=5 DeviceNotResponding на каждой передаче -
+ * СИМПТОМ «чёрных гнёзд» из EGOROV.LOG Сборки 5 (OHCI#2 p4/p5).
+ * Возврат к канону Linux - как в 0.3.0 build 10 (#481). */
+#define TD_T_DATA0    (2u << 24)
+#define TD_T_DATA1    (3u << 24)
 #define TD_T_CARRY    (0u << 24)
 #define TD_ROUND      (1u << 18)
 #define TD_CC_GET(v)  (((v) >> 28) & 0xFu)
@@ -3716,6 +3836,9 @@ static bool xm_bulk(int dir_in, void *buf, uint32_t len) {
                 }
                 return true;
             }
+            /* USB Mass Storage может ждать CBW/DATA/CSW в то время,
+             * как уже работающая мышь или клава завершает свой IN TRB. */
+            (void)hw_route_live_xhci_event(type, p, st, ctl);
         }
         if (timeout-- <= 0) {
             serial_puts("MOUSEHW: xHCI MSD bulk TIMEOUT (слот ");
@@ -4227,6 +4350,15 @@ static void zl_note(const char *what) {
 static void oh_kbd_state_reset(void) {
     memset(prev_k, 0, sizeof(prev_k));
     g_kbd_pkts = 0;
+    g_kbd_transition_logs = 0;
+}
+static void hw_trace_kbd_transition(const char *verb, uint8_t usage,
+                                   const char *bus) {
+    if (g_kbd_transition_logs >= 16u) return;
+    g_kbd_transition_logs++;
+    serial_puts("MOUSEHW: HID keyboard "); serial_puts(verb);
+    serial_puts(" usage="); serial_puthex(usage);
+    serial_puts(" via "); serial_puts(bus); serial_puts("\n");
 }
 static void oh_kbd_process(const uint8_t *r, int act, const char *bus) {
     uint8_t cur_k[6];
@@ -4271,7 +4403,10 @@ static void oh_kbd_process(const uint8_t *r, int act, const char *bus) {
         if (gone) {
             int ext = 0;
             uint8_t sc = hid_to_set1(u, &ext);
-            if (sc) oh_inject_sc(sc, ext, 1);
+            if (sc) {
+                hw_trace_kbd_transition("key-up", u, bus);
+                oh_inject_sc(sc, ext, 1);
+            }
         }
     }
     /* нажатия (есть в cur, не было в prev) */
@@ -4283,10 +4418,85 @@ static void oh_kbd_process(const uint8_t *r, int act, const char *bus) {
         if (fresh) {
             int ext = 0;
             uint8_t sc = hid_to_set1(u, &ext);
-            if (sc) oh_inject_sc(sc, ext, 0);
+            if (sc) {
+                hw_trace_kbd_transition("key-down", u, bus);
+                oh_inject_sc(sc, ext, 0);
+            }
         }
     }
     for (int i = 0; i < 6; i++) prev_k[i] = cur_k[i];
+}
+
+/* Маршрутизация событий живых xHCI HID endpoint'ов.
+ * Важно: evt_get() одновременно продвигает ERDP. Поэтому любой другой
+ * синхронный пользователь event ring (wait_cmd, ctrl_xfer, USB Mass
+ * Storage) обязан разобрать чужое завершение, а не просто отбросить его.
+ * Возвращает true, если событие принадлежало текущей живой мыши/клаве. */
+static bool hw_route_live_xhci_event(uint32_t type, uint64_t p,
+                                      uint32_t st, uint32_t ctl) {
+    (void)p;
+    if (type != TRB_EV_TRANSFER) return false;
+
+    const int owner = g_xi;
+    const uint32_t slot = ctl >> 24;
+    const uint32_t ep_id = (ctl >> 16) & 0x1Fu;
+    const uint32_t cc = st >> 24;
+    const uint32_t rem = st & 0x00FFFFFFu;
+
+    if (g_active && g_slot != 0 && g_ms_xi == owner &&
+        slot == (uint32_t)g_slot &&
+        ep_id == (2u * (uint32_t)lm_xep() + 1u)) {
+        const int before_x = g_mouse.x, before_y = g_mouse.y;
+        const bool before_left = g_mouse.left, before_right = g_mouse.right;
+        if (cc == CC_SUCCESS || cc == CC_SHORT_PACKET) {
+            int act = (int)lm_mps() - (int)rem;
+            if (act < 0) act = 0;
+            if (act > (int)sizeof(hw_pkt)) act = (int)sizeof(hw_pkt);
+            if (act > 0) {
+                g_packets++;
+                g_errors = 0;
+                usbdev_note_report(USBDEV_ROLE_MOUSE);
+                if (lm_absolute())    hw_tablet_report(hw_pkt, act);
+                else if (lm_rpt_ok()) hw_hid_report(hw_pkt, act);
+                else                  hw_boot_report(hw_pkt, act);
+                /* Если синхронное ожидание забрало событие ДО обычного
+                 * mouse_hw_poll(), передадим движение/клик следующему
+                 * потребителю, не затирая его очисткой флагов в poll(). */
+                if (!g_mouse_polling) {
+                    if (g_mouse.x != before_x || g_mouse.y != before_y)
+                        g_pending_mouse_moved = true;
+                    if (!before_left && g_mouse.left) g_pending_mouse_left = true;
+                    if (!before_right && g_mouse.right) g_pending_mouse_right = true;
+                }
+            } else {
+                zl_note("xHCI мышь: нулевая длина во время другого USB-ожидания");
+            }
+        } else {
+            zl_note("xHCI мышь: ошибка передачи во время другого USB-ожидания");
+            if (++g_errors >= 8u) hw_deactivate("transfer errors while waiting");
+        }
+        if (g_active) hw_arm();
+        return true;
+    }
+
+    if (g_kbd_slot != 0 && g_kb_xi == owner &&
+        slot == (uint32_t)g_kbd_slot &&
+        ep_id == (2u * (uint32_t)lk_xep() + 1u)) {
+        if (cc == CC_SUCCESS || cc == CC_SHORT_PACKET) {
+            int act = (int)lk_xmps() - (int)rem;
+            if (act < 0) act = 0;
+            if (act > (int)sizeof(hw_kbd_pkt)) act = (int)sizeof(hw_kbd_pkt);
+            if (act >= 1) oh_kbd_process(hw_kbd_pkt, act, "xHCI/deferred");
+            else zl_note("xHCI клава: нулевая длина во время другого USB-ожидания");
+        } else {
+            zl_note("xHCI клава: ошибка передачи во время другого USB-ожидания");
+        }
+        /* Событие уже извлечено из кольца — обязательно поставить новый
+         * interrupt-IN TRB, иначе клавиатура перестанет получать отчёты. */
+        hw_kbd_arm();
+        return true;
+    }
+    return false;
 }
 
 /* перестроить периодическую таблицу HCCA БЕЗ опоры на обход Skip-ED:
@@ -4415,11 +4625,70 @@ static int oh_dd8_probe(uint8_t *dd8, int port, int att, int *fake) {
     serial_puthex((uint32_t)cc8);
     if (cc8 == TD_CC_OK && !(dd8[0] == 0x12 && dd8[1] == 0x01)) {
         *fake = 1;
-        serial_puts(" ДАННЫЕ НЕ ДЕСКРИПТОР (фейк-OK, считаю неудачей) байты:");
+        serial_puts(" ДАННЫЕ НЕ ДЕСКРИПТОР (фейк-OK, считаю неудачей) [адрес ED=");
+        { char nba[8]; serial_puts(itoa((uint32_t)g_oh_addr, nba, 10)); }
+        serial_puts("] байты:");
         for (int i = 0; i < 8; i++) { serial_puts(" "); serial_puthex(dd8[i]); }
     }
     serial_puts("\n");
     return cc8;
+}
+
+/* [#492] СБОРКА 6: Сброс порта OHCI «как Linux» (drivers/usb/host/
+ * ohci-hub.c + hub.c hub_port_reset): (1) SetPortReset; (2) ждём снятия
+ * PRS (до 500 мс — спека: минимум 10 мс, AMD дольше QEMU); (3) W1C PRSC;
+ * (4) ПОЛЛИМ PES до 50 мс — на реальном AMD FCH бит PES отстаёт от
+ * снятия PRS, и прежнее «одно чтение сразу» видело 0 (EGOROV.LOG
+ * Сборки 5: raw=0x303, PES=0); (5) PES=0 → ПОВТОР сброса (Linux:
+ * PORT_RESET_TRIES), всего 3 попытки; (6) последняя надежда — запись
+ * SetPortEnable (2): на том же AMD FCH она поднимала PES (Сборка 5:
+ * притушение порта 4 видело PES=1 после такой записи), результат
+ * проверяем поллингом.  Перечисление продолжается ТОЛЬКО на
+ * ВКЛЮЧЁННОМ порту: передача в выключенный = cc=5 DeviceNotResponding
+ * (фото Сборки 5: семь cc=5 подряд на LS-гнёздах компаньона).
+ * Возврат: 1 = CCS=1 и PES=1; 0 = не включился/отвалился. */
+static int oh_port_reset_proper(int p) {
+    uint32_t v = 0;
+    for (int att = 1; att <= 3; att++) {
+        oh_w32(oh_port(p), 0x10u);              /* SetPortReset          */
+        int t = 500;
+        while ((oh_r32(oh_port(p)) & 0x10u) && t-- > 0) hw_delay(1000);
+        if (oh_r32(oh_port(p)) & 0x10u)
+            serial_puts("MOUSEHW: OHCI: сброс не закончился за 500 мс [#492]\n");
+        oh_w32(oh_port(p), 0x100000u);          /* W1C: очистить PRSC    */
+        v = oh_r32(oh_port(p));
+        int w = 50;                             /* PES может отставать   */
+        while (!(v & 2u) && (v & 1u) && w-- > 0) {
+            hw_delay(1000);
+            v = oh_r32(oh_port(p));
+        }
+        serial_puts("MOUSEHW: OHCI порт ");
+        { char n1[8]; serial_puts(itoa((uint32_t)p, n1, 10)); }
+        serial_puts(": сброс №");
+        { char n2[8]; serial_puts(itoa((uint32_t)att, n2, 10)); }
+        serial_puts(": raw=");
+        serial_puthex(v);
+        ud_ohci_port_bits(v);
+        serial_puts(" [#492]\n");
+        if (!(v & 1u)) return 0;                /* отвалился             */
+        if (v & 2u) return 1;                   /* включён — успех       */
+    }
+    /* [#492] 3 сброса не включили порт: SetPortEnable вручную — работал
+     * на реальном AMD FCH (EGOROV.LOG Сборки 5); QEMU игнорирует запись
+     * (у него порт включается сам при сбросе) — поведение не меняется. */
+    oh_w32(oh_port(p), 2u);
+    v = oh_r32(oh_port(p));
+    int w2 = 50;
+    while (!(v & 2u) && (v & 1u) && w2-- > 0) {
+        hw_delay(1000);
+        v = oh_r32(oh_port(p));
+    }
+    serial_puts("MOUSEHW: OHCI порт ");
+    { char n3[8]; serial_puts(itoa((uint32_t)p, n3, 10)); }
+    serial_puts(": [#492] PES=0 после 3 сбросов - SetPortEnable вручную:");
+    ud_ohci_port_bits(v);
+    serial_puts("\n");
+    return ((v & 1u) && (v & 2u)) ? 1 : 0;
 }
 
 /* Свежий ресет порта ВНУТРИ перечисления (oh_wedge_reset): устройство
@@ -4432,13 +4701,7 @@ static int oh_dd8_probe(uint8_t *dd8, int port, int att, int *fake) {
  * дескриптором - «ДАННЫЕ НЕ ДЕСКРИПТОР» на живом железе при исправном
  * коде передачи.  Ресет снимает это состояние. */
 static void oh_wedge_reset(int p) {
-    oh_w32(oh_port(p), 0x10u);              /* SetPortReset                */
-    int t = 600;
-    while ((oh_r32(oh_port(p)) & 0x10u) && t-- > 0) hw_delay(1000);
-    oh_w32(oh_port(p), 0x100000u);          /* очистить PRSC               */
-    uint32_t v = oh_r32(oh_port(p));
-    if (!(v & 1u)) return;                  /* отвалился при сбросе        */
-    if (!(v & 2u)) oh_w32(oh_port(p), 2u);  /* SetPortEnable, если не сам  */
+    (void)oh_port_reset_proper(p);          /* [#492] общий путь сброса */
     hw_delay(100000u);                      /* 100 мс recovery (LS-клава!) */
 }
 
@@ -4473,9 +4736,18 @@ static int ohci_enumerate(int ls, int port) {
      * нуле (жители ушли с нуля в oh_relocate_residents ещё ДО ресета
      * новичка).  Два устройства на адресе 0 слышали бы чужие control-
      * передачи - «каша» из Симптома 2.  Одиночное устройство живёт на 0
- * как в - проверенный путь не тронут. */
+ * как в - проверенный путь не тронут.
+ * [#486] ЭТАП 11: SET_ADDRESS - теперь БЕЗУСЛОВНО, первым ходом после
+ * ресета (порядок Linux hub_port_init: reset -> SET_ADDRESS ->
+ * GET_DESCRIPTOR по адресу). Устройство СВЕЖЕЕ после ресета охотно
+ * принимает адрес; прежний зачин с GET_DESCRIPTOR-пробами НА АДРЕСЕ 0
+ * реальные устройства не всегда уважают (фото Сборки 3, OHCI порты
+ * 4/5: SETUP и STATUS закрывались cc=0, НО устройство не давало ни
+ * байта данных - «ДАННЫЕ НЕ ДЕСКРИПТОР» нулями, круги A/B/D не
+ * помогали). Addr-0-пробы остались ЗАПАСНЫМ путём: если SET_ADDRESS
+ * не прошёл, круги ниже пойдут по адресу 0 как раньше. */
     g_oh_addr = 0;
-    if (g_oh_active || g_oh_kbd) {
+    {
         uint8_t na = g_oh_next_addr;
         g_oh_next_addr = (uint8_t)(na >= 127 ? 1 : na + 1);
         if (oh_ctrl(0x00, USB_REQ_SET_ADDRESS, na, 0, 0, 0) == TD_CC_OK) {
@@ -4483,9 +4755,9 @@ static int ohci_enumerate(int ls, int port) {
             char nb[8];
             serial_puts("MOUSEHW: HID: новичку выдан адрес ");
             serial_puts(itoa((uint32_t)na, nb, 10));
-            serial_puts("\n");
+            serial_puts(" сразу после ресета (Linux-порядок, [#486])\n");
         } else {
-            serial_puts("MOUSEHW: SET_ADDRESS не вышел - работаем на адресе 0\n");
+            serial_puts("MOUSEHW: SET_ADDRESS не вышел - пробы на адресе 0 (запасной путь)\n");
         }
     }
 
@@ -4648,6 +4920,50 @@ static int ohci_enumerate(int ls, int port) {
     uint16_t pid = (uint16_t)(dd[10] | ((uint16_t)dd[11] << 8));
     usb_db_report(vid, pid);
 
+    /* [#494] МЕГА-ЛОГ (OHCI): дескриптор + строки + TS. Буфер — СТАТИК
+     * ([#418]: стековые DMA-буферы могли пересекать границу страницы). */
+    {
+        static uint8_t oh_str_buf[64] __attribute__((aligned(4)));
+        char wl[26]; int wn = 0;
+        { const char *s = "OHCI#"; while (*s) wl[wn++] = *s++; }
+        { char nb[8]; const char *s = itoa((uint32_t)(g_oi + 1), nb, 10);
+          while (*s && wn < 20) wl[wn++] = *s++; }
+        { const char *s = " порт "; while (*s && wn < 24) wl[wn++] = *s++; }
+        { char nb[8]; const char *s = itoa((uint32_t)port, nb, 10);
+          while (*s && wn < 25) wl[wn++] = *s++; }
+        wl[wn] = 0;
+        ud_dev_desc(wl, dd, 18);
+        /* строки: язык → iManuf/iProd/iSer (по ТЕКУЩЕМУ адресу g_oh_addr) */
+        memset(oh_str_buf, 0, sizeof(oh_str_buf));
+        if (oh_ctrl(0x80, 0x06, 0x0300u, 0, 4, oh_str_buf) == TD_CC_OK) {
+            uint16_t lang = (uint16_t)(oh_str_buf[2] |
+                                       ((uint16_t)oh_str_buf[3] << 8));
+            static const char *names[3] = { "производитель", "продукт", "серийный №" };
+            uint8_t idxs[3];
+            idxs[0] = dd[14]; idxs[1] = dd[15]; idxs[2] = dd[16];
+            for (int si = 0; si < 3; si++) {
+                if (idxs[si] == 0) continue;
+                memset(oh_str_buf, 0, sizeof(oh_str_buf));
+                if (oh_ctrl(0x80, 0x06,
+                            (uint16_t)(((uint32_t)idxs[si] << 8) | 0x03u),
+                            lang, 64, oh_str_buf) != TD_CC_OK) {
+                    serial_puts("USB-STR: ["); serial_puts(wl);
+                    serial_puts("] "); serial_puts(names[si]);
+                    serial_puts(" — нет строки (норма, дальше не спрашиваю)\n");
+                    break;
+                }
+                serial_puts("USB-STR: ["); serial_puts(wl);
+                serial_puts("] "); serial_puts(names[si]);
+                serial_puts(": ");
+                ud_str_desc(oh_str_buf, 64);
+            }
+        } else {
+            serial_puts("USB-STR: ["); serial_puts(wl);
+            serial_puts("] язык не прочитан - строки пропускаю (норма)\n");
+        }
+        ud_ts("OHCI: дескрипторы прочитаны (см. выше)");
+    }
+
     /* Быстрый путь ЭП-таблицы: в ЭТОМ порту уже жил тот же vid/pid -
      * вид устройства и его эндпоинты известны, полный перебор
      * дескрипторов не нужен: сразу конфигурация и связывание. */
@@ -4720,6 +5036,18 @@ static int ohci_enumerate(int ls, int port) {
         for (int i = 0; i < 8; i++) { serial_puts(" "); serial_puthex(cfg[i]); }
         serial_puts("\n");
         ok = 0;
+    }
+    if (ok) {
+        /* [#494] МЕГА-ЛОГ (OHCI): конфиг-дескриптор целиком */
+        char wl[26]; int wn = 0;
+        { const char *s = "OHCI#"; while (*s) wl[wn++] = *s++; }
+        { char nb[8]; const char *s = itoa((uint32_t)(g_oi + 1), nb, 10);
+          while (*s && wn < 20) wl[wn++] = *s++; }
+        { const char *s = " порт "; while (*s && wn < 24) wl[wn++] = *s++; }
+        { char nb[8]; const char *s = itoa((uint32_t)port, nb, 10);
+          while (*s && wn < 25) wl[wn++] = *s++; }
+        wl[wn] = 0;
+        ud_cfg_desc(wl, cfg, total);
     }
     if (!ok) {
         char nb[8];
@@ -4922,6 +5250,26 @@ static bool oh_port_claimed(int q) {
     return false;
 }
 
+/* [#485] ЭТАП 11, для EHCI (см. prototype в mouse_hw.h): держит ли
+ * OHCI-компаньон ЭТОГО EHCI живое устройство на порту №port. Пару
+ * узнаём по PCI: та же шина, fn(компаньона)+2 == fn(EHCI) — раскладка
+ * AMD FCH (0:18.0 OHCI ↔ 0:18.2 EHCI, 0:19.0 ↔ 0:19.2). Номера портов
+ * компаньона и EHCI совпадают 1:1 (те же физические гнёзда). Считаем
+ * только ПОДНЯТЫЕ OHCI-инстансы (g_oh_mmio_a[i] != 0). Возврат 1 =
+ * «не трогай Port Owner у этого порта». */
+int ohci_companion_claimed(uint8_t bus, uint8_t dev, uint8_t fn, int port) {
+    (void)dev;
+    for (int i = 0; i < OHCI_NINST; i++) {
+        if (g_oh_mmio_a[i] == 0) continue;               /* инстанс не поднят */
+        if (g_oh_pci_a[i][0] != bus) continue;           /* не эта PCI-шина */
+        if ((uint8_t)(g_oh_pci_a[i][2] + 2u) != fn) continue;  /* не пара fn+2 */
+        if (g_oh_active && g_oh_ms_oi == i && port == (int)g_oh_ms_port)  return 1;
+        if (g_oh_kbd    && g_oh_kb_oi == i && port == (int)g_oh_kbd_port) return 1;
+        if (g_oh_msd    && g_oh_msd_oi == i && port == (int)g_oh_msd_port) return 1;
+    }
+    return 0;
+}
+
 /* [#409] битовка портов, притушенных oh_quiesce_others текущего
  * перечисления (возврат — oh_unquiesce_restore) */
 static uint16_t g_oh_quench_a[OHCI_NINST];
@@ -5044,6 +5392,7 @@ static void ohci_probe_port(int p, int force) {
     serial_puts("MOUSEHW: обнаружено новое устройство! (OHCI порт ");
     serial_puthex((uint32_t)p);
     serial_puts(")\n");
+    ud_ts("подключение на OHCI-порту (см. выше № порта) [#494]");
 
     /* сначала притушаем чужие неперечисленные порты - addr-0
      * трафик (SET_ADDRESS жителям ниже, затем новичку) обязан слышать
@@ -5054,25 +5403,27 @@ static void ohci_probe_port(int p, int force) {
      * молчит, адрес свободен для переезда. */
     oh_relocate_residents();
 
-    oh_w32(oh_port(p), 0x10u);            /* SetPortReset                  */
-    int t = 600;
-    while ((oh_r32(oh_port(p)) & 0x10u) && t-- > 0) hw_delay(1000);
-    oh_w32(oh_port(p), 0x100000u);        /* очистить PRSC                 */
+    /* [#492] СБОРКА 6: сброс Linux-style — до ВКЛЮЧЁННОГО порта (PES=1),
+     * до 3 попыток + поллинг отстающего PES + расшифровка битов в лог.
+     * Прежний код: один сброс, чтение «сразу» (PES на реальном AMD FCH
+     * отстаёт — читался 0) и запись 0x2 «SetPortEnable если не сам». */
+    if (!oh_port_reset_proper(p)) {
+        oh_diag_set("порт не включился после сброса [#492]");
+        serial_puts("MOUSEHW: OHCI порт ");
+        serial_puthex((uint32_t)p);
+        serial_puts(": НЕ ВКЛЮЧИЛСЯ (PES=0) после 3 сбросов - перечисление\n");
+        serial_puts("MOUSEHW: отменено; порт остаётся на рескане (Linux тоже\n");
+        serial_puts("MOUSEHW: ретраит сброс до появления PES) [#492]\n");
+        oh_unquiesce_restore();            /* [#409] соседи — назад в строй */
+        return;
+    }
     uint32_t v = oh_r32(oh_port(p));
     serial_puts("MOUSEHW: OHCI порт ");
     serial_puthex((uint32_t)p);
     serial_puts(": после сброса raw=");
     serial_puthex(v);
-    serial_puts("\n");
-    if (!(v & 1u)) {
-        char nb[8];
-        oh_diag_set("порт ");
-        oh_diag_set2(g_oh_diag, itoa((uint32_t)p, nb, 10));
-        oh_diag_set2(g_oh_diag, ": устройство отвалилось при сбросе");
-        oh_unquiesce_restore();            /* [#409] соседи — назад в строй */
-        return;                           /* отвалился во время сброса     */
-    }
-    if (!(v & 2u)) oh_w32(oh_port(p), 2u);/* SetPortEnable, если не сам    */
+    ud_ohci_port_bits(v);
+    serial_puts(" [#492]\n");
     /* recovery после ресета. LS-устройствам (клава/мышь) QEMU-ских
      * 10 мс мало: реальный LS девайс ещё не готов слушать (Linux ждёт
      * 100+ мс).  LS = LSDA БИТ 9 (RH_PS_LSDA=0x200, сверено с
@@ -5261,8 +5612,15 @@ static int probe_ohci(int oi, uint8_t bus, uint8_t dev, uint8_t fn) {
      * control-список ВООБЩЕ не обрабатывается (в текстлоге это было
      * «OHCI ctrl TIMEOUT dh=0 ed_halted=0»).  QEMU прощал: в его
      * ohci_reset fi=0x2edf зашито.  u-boot пишет FmInterval явно -
-     * делаем так же: FI=0x2EDF (1 мс @12МГц), FSMPS=0x2778. */
-    oh_w32(OH_FMINT, (0x2778u << 16) | 0x2EDFu);
+     * делаем так же: FI=0x2EDF (1 мс @12МГц), FSMPS=0x2778.
+     * [#497] FIT-переключение (бит 31) — как Linux ohci-hcd (fminterval
+     * |= FIT при каждой записи): по спеке OHCI 7.1.2 контроллер
+     * перезагружает счётчик кадра ТОЛЬКО при смене FIT; запись того же
+     * значения FIT могла оставлять AMD FCH со старым интервалом. */
+    {
+        uint32_t fit = oh_r32(OH_FMINT) & 0x80000000u;   /* текущий FIT */
+        oh_w32(OH_FMINT, (0x2778u << 16) | 0x2EDFu | (fit ^ 0x80000000u));
+    }
     /* HcLSThreshold - регистр, который HCR НЕ СБРАСЫВАЕТ (спека OHCI
  * 7.1). писала FmInterval, но забыла LSThreshold: BIOS мог
      * оставить 0, и HC не выпускает НИ ОДНОЙ low-speed транзакции - LS
@@ -6207,6 +6565,9 @@ void mouse_hw_force_usb(int force) { g_force_usb = force; }
 void mouse_hw_init(int fb_w, int fb_h) {
     if (g_scanned) return;
     g_scanned = true;
+    /* Диагностическая метка для проверки, что загружено именно ядро с USB-патчем.
+     * Номер версии Egorov OS намеренно не меняем. */
+    serial_puts("USB-FIX-CHECK: xHCI per-slot EP0 rings present\n");
 
     /* ГИГИЕНА СОСТОЯНИЯ OHCI (фото: в OHCI-СНИМКе МУСОР 0x32 во
      * всех полях и «регистрах» - statics OHCI-блока кто-то затёр ПОСЛЕ
@@ -6546,6 +6907,20 @@ static int xhci_try_port(int p) {
      * (g_kbd_slot) hotplug больше не глушит. */
     if (g_eslot != 0) hw_disable_slot();
     int ok = hw_enumerate((uint8_t)p, speed);
+    if (ok && g_last_dd_port == (uint8_t)p) {
+        /* [#494] строки — ПОСЛЕ полного перечисления (бинд уже случился,
+         * EP0 для boot-HID дальше не нужен): STALL строкового запроса
+         * больше не может уронить устройство (e2e T6 научил). */
+        char wl[26]; int wn = 0;
+        { const char *s = "xHCI#"; while (*s) wl[wn++] = *s++; }
+        { char nb[8]; const char *s = itoa((uint32_t)(g_xi + 1), nb, 10);
+          while (*s && wn < 20) wl[wn++] = *s++; }
+        { const char *s = " порт "; while (*s && wn < 24) wl[wn++] = *s++; }
+        { char nb[8]; const char *s = itoa((uint32_t)p, nb, 10);
+          while (*s && wn < 25) wl[wn++] = *s++; }
+        wl[wn] = 0;
+        hw_dump_strings(wl, g_last_dd);
+    }
     if (!ok) mhw_port_set(sv_port); /* +вернуть порт под штампом */
     if (ok && p < (int)sizeof(g_port_role)) g_port_role[p] = PR_MOUSE;
     /* [#426] привязка КЛАВИАТУРЫ — тоже УСПЕХ порта: раньше kbd-биндинг
@@ -6742,14 +7117,20 @@ static int probe_xhci(int xi, uint8_t xbus, uint8_t xdev, uint8_t xfn,
     memset(hw_devctx, 0, sizeof(hw_devctx));
     memset(hw_erst, 0, sizeof(hw_erst));
     for (int i = 0; i < 16; i++) { hw_cmd[i].control = 0; hw_evt[i].control = 0; }
-    for (int i = 0; i < 8; i++)  { hw_ep0[i].control = 0; hw_ep1[i].control = 0; }
+    memset(hw_ep0_a[xi], 0, sizeof(hw_ep0_a[xi]));
+    for (int i = 0; i < 8; i++)  { hw_ep1[i].control = 0; }
     for (int i = 0; i < 8; i++) hw_kbd_ep1[i].control = 0;
-    /* 0.3.0: кольца указывают на память ЭТОГО инстанса (без этого
-     * .t остаётся мусором и TRB уезжают по случайному адресу — QEMU
-     * читал пустой command ring, «enable slot failed cc=0») */
+    /* У каждого устройства свой EP0 ring: его база должна совпадать с
+     * dequeue pointer, записанным в Endpoint Context этого slot ID.
+     */
     g_r_cmd[xi].t = hw_cmd_a[xi];      g_r_cmd[xi].n = 16;
-    g_r_cmd[xi].idx = 0;               g_r_cmd[xi].cyc = 1;   /* !cycle */
-    g_r_ep0[xi].t = hw_ep0_a[xi];      g_r_ep0[xi].n = 8;
+    g_r_cmd[xi].idx = 0;               g_r_cmd[xi].cyc = 1;
+    for (int slot_id = 0; slot_id < XHCI_SLOT_MAX; slot_id++) {
+        g_r_ep0[xi][slot_id].t = hw_ep0_a[xi][slot_id];
+        g_r_ep0[xi][slot_id].n = 8;
+        g_r_ep0[xi][slot_id].idx = 0;
+        g_r_ep0[xi][slot_id].cyc = 1;
+    }
     g_r_ep1[xi].t = hw_ep1_a[xi];      g_r_ep1[xi].n = 8;
     g_r_kbd_ep1[xi].t = hw_kbd_ep1_a[xi]; g_r_kbd_ep1[xi].n = 8;
     g_r_msd_o[xi].t = hw_msd_out_a[xi];  g_r_msd_o[xi].n = 8;
@@ -6758,8 +7139,7 @@ static int probe_xhci(int xi, uint8_t xbus, uint8_t xdev, uint8_t xfn,
     r_msd_i.idx = 0;  r_msd_i.cyc = 1;
     r_kbd_ep1.idx = 0;
     r_kbd_ep1.cyc = 1;
-    r_ep0.idx = 0;                     /* enqueue = fresh dequeue */
-    r_ep0.cyc = 1;
+    /* All per-slot EP0 rings were reset above. */
     r_ep1.idx = 0;
     r_ep1.cyc = 1;
     memset(g_port_role, 0, sizeof(g_port_role));
@@ -6890,9 +7270,14 @@ static int probe_xhci(int xi, uint8_t xbus, uint8_t xdev, uint8_t xfn,
 
 /* ── Public: poll event ring (никогда не блокирует) ───────────────────────── */
 void mouse_hw_poll(mouse_state_t *out) {
-    g_mouse.clicked_left  = false;
-    g_mouse.clicked_right = false;
-    g_mouse.moved         = false;
+    /* События, обработанные внутри синхронных USB-ожиданий до входа в
+     * poll(), забираем один раз здесь. Иначе mouse_hw_kbd_poll() или
+     * LOGWRITER могли бы принять движение, а эта очистка его стёрла. */
+    g_mouse.clicked_left  = g_pending_mouse_left;
+    g_mouse.clicked_right = g_pending_mouse_right;
+    g_mouse.moved         = g_pending_mouse_moved;
+    g_pending_mouse_left = g_pending_mouse_right = g_pending_mouse_moved = false;
+    g_mouse_polling = true;
 
     /* 0.3.0: события ВСЕХ живых xHCI-инстансов — мышь и клавиатура могут
      * жить на РАЗНЫХ контроллерах (AMD FCH: 0:10.0/0:10.1). */
@@ -7011,6 +7396,7 @@ void mouse_hw_poll(mouse_state_t *out) {
         mouse_hw_hotplug_sweep();
 
     if (out) *out = g_mouse;
+    g_mouse_polling = false;
 }
 
 /* ── Public: опрос ТОЛЬКО клавиатурной части (никогда не блокирует) ────────

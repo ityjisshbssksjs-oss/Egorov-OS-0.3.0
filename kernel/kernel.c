@@ -44,20 +44,21 @@
 #include "power.h"
 #include "timer.h"    /* PIT-калибровка задержек (kdelay_*) */
 #include "version.h"  /* [#473] ЭТАП 9: номер СБОРКИ (EGOROV_OS_BUILD_S) */
+#include "usbdump.h" /* [#494] МЕГА-ЛОГ: PCI-дамп всех устройств + TS */
 #include "logstick.h" /* [LOGS] ЭТАП 11: EGOROV.LOG на разделе LOGS */
 
 #include "string.h"
 
 /* Глубокий аудит (G4, п.9c): тег версии собран в ОДНОМ месте — все
  * серийные баннеры/подписи ниже склеиваются из EGOROV_TAG.  Результиру
- * текст НЕИЗМЕНЕН (побайтно те же строки): «Egorov OS 0.3.0» ЗАМОРОЖЕН,
+ * версия берётся из kernel/version.h; номер сборки задаётся там же,
  * e2e-маркеры не задеты (os/tests/e2e_audit.py версию не матчит —
  * проверено grep'ом).
  * [#473] ЭТАП 9: к баннерам ДОБАВЛЕН номер СБОРКИ из kernel/version.h
  * («Сборка 1», «Сборка 2», …) — по нему видно, какой образ реально
  * загрузился с флешки (Rufus/DD мог не перезаписать).  e2e-маркеры
  * номер сборки не матчат — проверено. */
-#define EGOROV_TAG "0.3.0"
+#define EGOROV_TAG EGOROV_OS_VER
 
 
 #define MULTIBOOT_BOOTLOADER_MAGIC 0x2BADB002
@@ -151,7 +152,7 @@ static void idt_install(void) {
     __asm__ volatile("lidt %0" :: "m"(g_idtr) : "memory");
 }
 
-/* ── Serial port (COM1) debug output ──────────────────────────────────────── */
+/* ── Serial port (COM1) debug output; bounded wait on absent UART ──────────── */
 
 #define COM1 0x3F8
 
@@ -165,9 +166,34 @@ void serial_init(void) {
     outb(COM1 + 4, 0x0B);   /* RTS+DTR+IRQ */
 }
 
+/* A real PC may have no usable legacy UART at COM1.  Never let a missing
+ * UART hang kernel_main before framebuffer/textlog initialisation.  The
+ * caller mirrors each byte into klog independently of UART success. */
+#define SERIAL_TX_POLL_LIMIT 100000u
+static int g_serial_disabled = 0;
+static int g_serial_warned = 0;
+static void klog_putc(char c); /* defined below; safe RAM/screen mirror */
+
 static void serial_putc(char c) {
-    while (!(inb(COM1 + 5) & 0x20)) {} /* wait for transmit empty */
-    outb(COM1, (uint8_t)c);
+    uint32_t spins;
+    if (g_serial_disabled) return;
+    for (spins = 0; spins < SERIAL_TX_POLL_LIMIT; ++spins) {
+        if (inb(COM1 + 5) & 0x20) {
+            outb(COM1, (uint8_t)c);
+            return;
+        }
+    }
+    /* COM1 never became ready. Disable further UART polling and emit one
+     * warning through the RAM/text-console path instead of serial itself. */
+    g_serial_disabled = 1;
+    if (!g_serial_warned) {
+        static const char warning[] =
+            "\n[WARN] COM1 transmit timeout; serial disabled, continuing with RAM/screen log\n";
+        size_t i;
+        g_serial_warned = 1;
+        for (i = 0; i + 1 < sizeof(warning); ++i)
+            klog_putc(warning[i]);
+    }
 }
 
 /* ── TEXTLOG — текстовая консоль «test on errors» ──────────────────────────
@@ -692,6 +718,14 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi) {
     timer_init();
     serial_puts("timer_init done\n");
 
+    /* [#494] МЕГА-ЛОГ: метка старта (TS=Nс во всех последующих событиях)
+     * и ПОЛНЫЙ PCI-ДАМП — «в логе пишем обо всём»: каждое устройство
+     * на всех шинах, с именами из встроенной выжимки pci.ids, BAR0 и
+     * прерыванием. Это ответ на «может список нужен»: список нужен
+     * для ИМЁН (и теперь он есть); драйверы ищут по классу — как Linux. */
+    ud_boot_mark();
+    ud_pci_dump_all();
+
     /* ── Step 3: validate multiboot environment ───────────────────────────*/
     if (magic != MULTIBOOT_BOOTLOADER_MAGIC) {
         serial_puts("BAD MAGIC - panic\n");
@@ -859,6 +893,14 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi) {
     mouse_hw_init_ohci();
     serial_puts("mouse_hw_init_ohci done\n");
 
+    /* [#490] ЭТАП 13: HCR-сброс OHCI-компаньона при его инициализации
+       сбрасывает мультиплексор EHCI↔OHCI — PortOwner, только что
+       поставленный ehci_init, СЛЕТАЕТ, LS-гнёзда возвращаются на
+       EHCI-сторону и «мышь видна в карте, но не работает» (EGOROV.LOG
+       Сборки 4: OHCI-порты все 0x100 — слепые). Переподнимаем PO СЕЙЧАС,
+       пока OHCI живой и слушает свои порты. */
+    ehci_companion_reroute();
+
     /* 4) UHCI-мышь (HID boot, port 1.x и «2.0-порты у компаньонов»).
        usb_init() [mass storage] намеренно оставлен выключен: при
        отсутствии USB-накопителя контроллер UHCI остаётся свободен
@@ -986,7 +1028,60 @@ void kernel_main(uint32_t magic, struct multiboot_info *mbi) {
         serial_puts("TEXTLOG: заново БЕЗ перетыкания (фото: p4/p5=0x303, cc setup=5 -\n");
         serial_puts("TEXTLOG: два устройства на адресе 0 глушили друг друга; чужие\n");
         serial_puts("TEXTLOG: порты притушаются.  Мышь и клава работают как раньше.\n");
-serial_puts("TEXTLOG: инициализация завершена; ожидание мыши.\n");
+        serial_puts("TEXTLOG: Сборка 5 [#487-#490] по EGOROV.LOG с реального AMD:\n");
+        serial_puts("TEXTLOG: 1) HCHalted гасит «живость» расписания - висячий RECL\n");
+        serial_puts("TEXTLOG: больше не обманывает самозапуск RS: контроллер\n");
+        serial_puts("TEXTLOG: ЕHCI честно поднимается (#487); рестарт doorbell\n");
+        serial_puts("TEXTLOG: поднимает ОСТАНОВЛЕННЫЙ HC повторной записью RS (#489).\n");
+        serial_puts("TEXTLOG: 2) Контрольная передача: IAAD-толчок сразу после\n");
+        serial_puts("TEXTLOG: вставки qH (припаркованный async будится звонком,\n");
+        serial_puts("TEXTLOG: не ожиданием IAA, которого на AMD нет) + фоллбэк\n");
+        serial_puts("TEXTLOG: «цепочка на ГОЛОВЕ кольца (H=1)» через 100 мс (#488).\n");
+        serial_puts("TEXTLOG: 3) HCR-сброс OHCI-компаньона СБРАСЫВАЕТ маршрутизацию\n");
+        serial_puts("TEXTLOG: PortOwner: LS-мышь/клава возвращались на EHCI-сторону\n");
+        serial_puts("TEXTLOG: и 3 неудачи за 5 с cooldown убивали гнездо НАВСЕГДА.\n");
+        serial_puts("TEXTLOG: Теперь маршрутизация самовосстанавливается: PO=0 +\n");
+        serial_puts("TEXTLOG: линия K = отпустить компаньону ЗАНОВО (не реже 1/5 с),\n");
+        serial_puts("TEXTLOG: плюс разовый reroute сразу после инициализации OHCI;\n");
+        serial_puts("TEXTLOG: маршрутизация больше НЕ считается «неудачей» (#490).\n");
+        serial_puts("TEXTLOG: 4) Карта гнёзд: скорость EHCI-порта по PED/LineStatus\n");
+        serial_puts("TEXTLOG: (было поле PSPD из xHCI - LS печатался как FS) (#491).\n");
+        serial_puts("TEXTLOG: Сборка 6 [#492-#494] — «в логе пишем обо всём» + ответ\n");
+        serial_puts("TEXTLOG: «почему Linux работает на любом ПК»: Linux НЕ знает\n");
+        serial_puts("TEXTLOG: больше устройств — он просто (а) повторяет сброс порта\n");
+        serial_puts("TEXTLOG: пока порт не ВКЛЮЧИТСЯ (PES=1; #492: до 3 попыток +\n");
+        serial_puts("TEXTLOG: поллинг отстающего бита; раньше PES=0 после сброса\n");
+        serial_puts("TEXTLOG: читался как «включён» и все передачи = cc=5),\n");
+        serial_puts("TEXTLOG: (б) НИКОГДА не шлёт передачи в остановленный контроллер\n");
+        serial_puts("TEXTLOG: (#493: HCHalted поднимается записью RS с ДОКАЗАННЫМ\n");
+        serial_puts("TEXTLOG: поллингом — висячие биты ASS больше не обманывают),\n");
+        serial_puts("TEXTLOG: (в) держит списки устройств (pci.ids/usb.ids) только для\n");
+        serial_puts("TEXTLOG: ИМЁН — драйверы привязываются по КЛАССУ (HID/MSD).\n");
+        serial_puts("TEXTLOG: Теперь всё это есть и у нас: полный PCI-дамп с именами\n");
+        serial_puts("TEXTLOG: в начале журнала, дескрипторы и СТРОКИ (производитель/\n");
+        serial_puts("TEXTLOG: продукт/серийник) каждого USB-устройства, расшифровка\n");
+        serial_puts("TEXTLOG: битов портов/статусов и метки времени TS=Nс (#494).\n");
+        serial_puts("TEXTLOG: Сборка 6 [#495-#498] — три бага, невидимых в QEMU:\n");
+        serial_puts("TEXTLOG: #495 EHCI: пока бит IAA (звонок async-обхода) стоит\n");
+        serial_puts("TEXTLOG: неподтверждённым, контроллер ПАРКУЕТ обход кольца\n");
+        serial_puts("TEXTLOG: (EHCI 1.0 §4.8.5) — вставленный qH никогда не\n");
+        serial_puts("TEXTLOG: исполняется, qTD вечно ACTIVE. Теперь IAA квитируется\n");
+        serial_puts("TEXTLOG: (R/WC) ДО каждого звона и внутри ожидания — как в\n");
+        serial_puts("TEXTLOG: Linux iaad_watchdog. На AMD-фото Сборки 5: IAA=1+IAAD=1\n");
+        serial_puts("TEXTLOG: на КАЖДОМ дампе таймаута.\n");
+        serial_puts("TEXTLOG: #498 OHCI: кодировка тогглов TD была ОБРАТНОЙ (01/10\n");
+        serial_puts("TEXTLOG: вместо Linux 10/11): SETUP уходил с зарезервированным\n");
+        serial_puts("TEXTLOG: кодом 01b, DATA/STATUS — с DATA0 вместо DATA1. QEMU\n");
+        serial_puts("TEXTLOG: контрольные тогглы не моделирует, а реальный AMD честно\n");
+        serial_puts("TEXTLOG: гнал бит на провод: устройство ACKало SETUP, но игнори-\n");
+        serial_puts("TEXTLOG: ровало DATA-IN/STATUS-IN со сбитым тогглом -> cc=5 на\n");
+        serial_puts("TEXTLOG: КАЖДОЙ передаче — симптом «чёрных гнёзд» из EGOROV.LOG.\n");
+        serial_puts("TEXTLOG: #496 строки: wValue собирался наоборот (index<<8|0x03) —\n");
+        serial_puts("TEXTLOG: устройство получало «дай DEVICE №3» вместо STRING #1;\n");
+        serial_puts("TEXTLOG: теперь в логе видны имена («QEMU USB Keyboard»).\n");
+        serial_puts("TEXTLOG: #497 OHCI: FIT-переключение при записи HcFmInterval +\n");
+        serial_puts("TEXTLOG: декодер EHCI-статусов по битам спеки (HALT=12, ASS=15).\n");
+        serial_puts("TEXTLOG: инициализация завершена; ожидание мыши.\n");
         serial_puts("TEXTLOG: ESC или Enter - рабочий стол сразу; 90 сек без единой\n");
         serial_puts("TEXTLOG: клавиши - рабочий стол откроется сам.\n");
         if (g_sticklog) {

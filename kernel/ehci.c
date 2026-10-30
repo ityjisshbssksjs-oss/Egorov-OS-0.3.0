@@ -95,9 +95,16 @@
 #include "mouse_hw.h"  /* [#459] portmap_pm_n/portmap_pm_alive для КАРТЫ ГНЕЗД */
 #include "io.h"
 #include "string.h"
+#include "usbdump.h"  /* [#494] МЕГА-ЛОГ: дескрипторы/строки/биты портов */
 #include "timer.h"    /* F2-15: kdelay_us/kdelay_ms (PIT-калибровка) */
 
 extern void serial_puthex(uint32_t v);
+/* [#485] ЭТАП 11: живое ли устройство у OHCI-компаньона на порту №port
+ * (мышь/клава/флешка; реализация в mouse_hw.c — OHCI-часть). Нужно,
+ * чтобы НЕ переписывать Port Owner порту, который компаньон УЖЕ
+ * обслуживает: повторный PO на AMD FCH = «release»-шторм ресетов. */
+extern int ohci_companion_claimed(uint8_t bus, uint8_t dev, uint8_t fn,
+                                   int port);
 
 /* ── PCI config-space access ── */
 #define PCI_ADDR 0xCF8u
@@ -152,16 +159,29 @@ static uint32_t eh_dma32(const uint32_t *p) {
 #define CMD_ASE   (1u << 5)      /* async schedule enable    (USBCMD.5) */
 #define CMD_IAAD  (1u << 6)      /* async advance doorbell             */
 
-#define STS_HALT  (1u << 12)
 #define STS_IAA   (1u << 5)
-/* G2 (собственная находка): биты расписаний в USBSTS по спеке EHCI 1.0
- * (Table 2-10; ср. Linux STS_PSS=1<<14 / STS_ASS=1<<15): периодика —
- * бит 14, async — бит 15. Прежний STS_PSS=1<<15 был на самом деле ASS:
- * eh_sched_rebuild «ждал останова периодики» по async-биту — на живом
- * HC ASS=1 всегда, ожидание выжигало ~20 мс таймаутом, и eh_fl
- * переписывался при РАБОТАЮЩЕМ периодическом расписании. */
-#define STS_PSS   (1u << 14)     /* periodic schedule status           */
-#define STS_ASS   (1u << 15)     /* async schedule status              */
+/* [#481] ЭТАП 11, КРИТИЧЕСКИЙ (фото AMD FCH, Сборка 3): биты
+ * расписаний USBSTS по спеке EHCI 1.0 (Table 2-24), Linux ehci-regs.h
+ * (STS_ASS=1<<12, STS_PSS=1<<13, STS_RECL=1<<14, STS_HALT=1<<15) и
+ * QEMU hw/usb/hcd-ehci.h СОВПАДАЮТ:
+ *   бит 12 = ASS  (async schedule status)
+ *   бит 13 = PSS  (periodic schedule status)
+ *   бит 14 = RECL (reclamation)
+ *   бит 15 = HCHalted (контроллер не работает)
+ * Прежние определения были ПЕРЕВЁРНУТЫ (ASS=15, PSS=14, HALT=12):
+ * eh_ensure_async «ждал подъёма ASS» по биту HCHalted → на реальном
+ * AMD (расписание живо, HALT=0) ВЕЧНЫЙ «async-расписание не
+ * поднимается (ASS=0)» → ни одной контрольной передачи EHCI (фото:
+ * «перечисление НЕ удалось (3 попыток)» на ГНЕЗДЕ с мышью USB 2.0);
+ * init наоборот считал «контроллер работает» по биту ASS=0 пустого
+ * кольца (пустая проверка). В QEMU баг был НЕВИДИМ: у qemu-ehci бит
+ * HCHalted после reset остаётся «липким» в 1 при живом расписании —
+ * перевёрнутая проверка «ASS=бит15» проходила мгновенно (T2 PASS),
+ * а на железе гарантированно падала. */
+#define STS_ASS   (1u << 12)     /* async schedule status              */
+#define STS_PSS   (1u << 13)     /* periodic schedule status           */
+#define STS_RECL  (1u << 14)     /* reclamation (кольцо пустое/живое)  */
+#define STS_HALT  (1u << 15)     /* HCHalted: контроллер не работает   */
 
 /* PORTSC.  Поля СКОРОСТИ у EHCI в PORTSC НЕТ (это не xHCI): включённый
  * порт (PED=1) = high-speed; иначе скорость видна по линии (биты 10-11). */
@@ -285,6 +305,18 @@ static bool     g_running_a[EH_NINST];
 static uint8_t  g_next_addr_a[EH_NINST];
 static char     g_diag_a[EH_NINST][96];
 static uint8_t  g_bd_a[EH_NINST][3];      /* bus/dev/fn наших контроллеров */
+/* [#485] ЭТАП 11: PCI-адрес инстанса ПО g_ei (g_bd_a индексируется
+ * g_ours_n и расходится с g_ei при неудачном подъёме) — нужен для
+ * сверки с компаньоном (ohci_companion_claimed). */
+static uint8_t  g_mybd_a[EH_NINST][3];
+/* [#485] ЭТАП 11: cooldown переписывания Port Owner (в секундах
+ * опроса). AMD FCH сам сбрасывает PO при активности компаньона, а
+ * каждая повторная маршрутизация — «release» для OHCI: тот видит
+ * CSC, сбрасывает порт и перечисляет устройство ЗАНОВО (фото Сборки
+ * 3: порты 4/5 перечислялись каждую секунду вечно). Повторная
+ * маршрутизация — не чаще раза в 5 с и только если компаньон НЕ
+ * держит на этом порту живое устройство. */
+static uint8_t  g_route_cool_a[EH_NINST][16];
 
 #define eh_fl      (eh_fl_a[g_ei])
 #define eh_head    (eh_head_a[g_ei])
@@ -306,6 +338,8 @@ static uint8_t  g_bd_a[EH_NINST][3];      /* bus/dev/fn наших контро�
 #define eh_addr_bm (eh_addr_bm_a[g_ei])
 #define g_conn     (g_conn_a[g_ei])
 #define g_rxlen    (g_rxlen_a[g_ei])
+#define g_mybd     (g_mybd_a[g_ei])
+#define g_route_cool (g_route_cool_a[g_ei])
 
 /* ── Общее состояние драйвера ── */
 static int      g_ours_n;                  /* сколько инстансов поднято   */
@@ -375,19 +409,57 @@ static void qtd_bufs(eh_qtd_t *t, uint32_t phys) {
  * (голова сама на себя) → ASE=1 — и только потом вернуть false
  * («передача не стартовала»). HCRESET сознательно не делаем — слишком
  * грубо: снёс бы оба расписания и адреса всех устройств инстанса. */
-/* ── Поднять async-расписание и ДОЖДАТЬСЯ ASS=1 ──────────────────────
+/* ── Поднять async-расписание и дождаться признака жизни ──────────────
  * [#404, фото «doorbell timeout» ×3] IAAD-звонок имеет смысл ТОЛЬКО
  * при работающем кольце: на AMD FCH звонок в остановленный/не
- * поднятый async не даёт IAA НИКОГДА — все три попытки GET_DESCRIPTOR
- * умирали на doorbell. Перед звонком/вставкой поднимаем ASE и ждём
- * подтверждения STS_ASS (спека 4.8: расписание активно только при
- * ASS=1). Возврат false = кольцо мертво, передачу стартовать нельзя. */
+ * поднятый async не даёт IAA НИКОГДА. Перед звонком/вставкой
+ * поднимаем ASE и ждём подтверждения. Возврат false = кольцо мертво,
+ * передачу стартовать нельзя.
+ * [#482] ЭТАП 11: «подтверждение» — НЕ один ASS. На AMD FCH (фото
+ * Сборки 3, sts=0x400C) пустое reclamation-кольцо ДЕРЖИТ RECL=1 и
+ * НИКОГДА не поднимает ASS: строгое ожидание ASS само по себе
+ * ломало бы драйвер на честном железе. Живость = ASS ИЛИ RECL
+ * (QEMU: ASS зеркалит ASE; AMD: RECL горит на пустом кольце, ASS
+ * поднимается при реальной работе).
+ * [#487] ЭТАП 13, КРИТИЧЕСКИЙ (EGOROV.LOG Сборки 4, реальный AMD FCH):
+ * HCHalted=1 ГАСИТ «живость» ВСЕГДА. Фото первой же передачи EHCI#1
+ * порт 1: sts=0x0000C004 = HALT+RECL+PCD при cmd RS=1 — контроллер
+ * стоял (RS «проглочен» затянувшимся HCRESET, класс #483), а RECL=1
+ * ОСТАЛСЯ висячим с BIOS-эпохи. Прежняя проверка (ASS|RECL без учёта
+ * HALT) читала этот висячий RECL как «расписание живо»: самозапуск RS
+ * в init (#483) НЕ срабатывал, GET_DESCRIPTOR уходил в мёртвый
+ * контроллер, «EHCI-DBG: xfer timeout … sts=0xC004» — и порт 1
+ * («мышь/клава USB 2.0 high-speed») не перечислялся НИКОГДА. Теперь:
+ * HALT=1 без ASS ⇒ живости нет (RECL/FLR — только у РАБОТАЮЩЕГО HC);
+ * липкий-HALT QEMU с ASS=1 живостью остаётся (см. тело функции). */
+static bool eh_async_live(void) {
+    uint32_t sts = eh_r32(g_op + R_USBSTS);
+    return (sts & (STS_ASS | STS_RECL)) != 0;
+}
+
 static bool eh_ensure_async(void) {
-    if (eh_r32(g_op + R_USBSTS) & STS_ASS) return true;
-    eh_w32(g_op + R_USBCMD, eh_r32(g_op + R_USBCMD) | CMD_ASE);
+    uint32_t sts0 = eh_r32(g_op + R_USBSTS);
+    /* [#482] быстрый путь: HALT=0 и есть признак расписания — жив
+     * (AMD: RECL на пустом кольце; QEMU: ASS-зеркало ASE). */
+    if (!(sts0 & STS_HALT) && (sts0 & (STS_ASS | STS_RECL))) return true;
+    /* [#487] ЭТАП 13, КРИТИЧЕСКИЙ: HALT горит ИЛИ признаков нет.
+     * Биты «стоящий-AMD» (HALT=1 + висячий RECL с BIOS-эпохи, RS
+     * проглочен — фото Сборки 4: sts=0xC004 при cmd RS=1, передача
+     * уходила в МЁРТВЫЙ контроллер) и «липкий-QEMU» (HALT=1 при
+     * живом расписании — примечание [#481]) НЕОТЛИЧИМЫ. Поэтому
+     * ДЕЙСТВУЕМ, а не гадаем по битам: повторная запись ASE|RS
+     * безвредна на живом HC (значение не меняется) и ПОДНИМАЕТ
+     * остановленный (класс #483: «повторная запись RS запускает»). */
+    eh_w32(g_op + R_USBCMD, eh_r32(g_op + R_USBCMD) | CMD_ASE | CMD_RS);
     int t = 20000;                          /* ~200 мс на подъём     */
-    while (!(eh_r32(g_op + R_USBSTS) & STS_ASS) && t-- > 0) eh_delay(10);
-    if (eh_r32(g_op + R_USBSTS) & STS_ASS) return true;
+    while (t-- > 0) {
+        if (eh_async_live()) return true;
+        eh_delay(10);
+    }
+    /* [#483] класс «проглоченный RS» закрыт записью ASE|RS выше (фото
+     * Сборки 3: cmd=0x00080B31 RS=1 при sts HCHalted=1; Сборки 4:
+     * первая передача в мёртвый HC, sts=0xC004). Сюда попадает только
+     * HC, мёртвый ПОСЛЕ повторной записи. */
     serial_puts("EHCI: async-расписание не поднимается (ASS=0), inst=");
     { char nb[8]; serial_puts(itoa((uint32_t)(g_ei + 1), nb, 10)); }
     serial_puts(" cmd=");
@@ -398,10 +470,93 @@ static bool eh_ensure_async(void) {
     return false;
 }
 
+/* Проверка корня async-кольца по ФАКТИЧЕСКИМ адресам рантайма.
+ * Build 2 доказал, что одного ASE/ASS недостаточно: HC мог иметь ASS=1,
+ * но контрольный qTD оставался ACTIVE, а IAA не приходил. Проверяем, что
+ * ASYNCLISTADDR указывает на элемент канонического кольца, и что при
+ * необходимости восстанавливаем корень только после ASS=0 (HC больше не
+ * читает список). Периодические QH живут в eh_fl и не затрагиваются
+ * этой процедурой.
+ * [#484] ЭТАП 11: AMD FCH сам ДВИГАЕТ ASYNCLISTADDR при обходе кольца
+ * (курсор): в init 0x7AC0 (head), после первой передачи 0x79C0 (qhc) —
+ * фото Сборки 3. Это НЕ поломка: оба — элементы канонического кольца
+ * head<->qhc, и повторная маршрутизация «корня» на каждом цикле лишь
+ * останавливала/поднимала расписание (по 200+ мс на попытку). Чиним
+ * только ЧУЖОЙ адрес (ни head, ни qhc). */
+static bool eh_async_root_sanity(void) {
+    uint32_t head_phys = ((uint32_t)&eh_head[0]) & 0xFFFFFFE0u;
+    uint32_t qhc_phys  = ((uint32_t)&eh_qhc[0]) & 0xFFFFFFE0u;
+    uint32_t async_phys = eh_r32(g_op + R_ASYNC) & 0xFFFFFFE0u;
+    if (async_phys == head_phys || async_phys == qhc_phys) return true;
+
+    serial_puts("EHCI-RING-CHECK: корень не совпал; head=");
+    serial_puthex(head_phys);
+    serial_puts(" qhc=");
+    serial_puthex(qhc_phys);
+    serial_puts(" ASYNCLISTADDR=");
+    serial_puthex(async_phys);
+    serial_puts(" — останавливаю async и чиню адрес\n");
+
+    uint32_t oldcmd = eh_r32(g_op + R_USBCMD);
+    eh_w32(g_op + R_USBCMD, oldcmd & ~(CMD_ASE | CMD_IAAD));
+    int t = 20000;
+    while ((eh_r32(g_op + R_USBSTS) & STS_ASS) && t-- > 0)
+        eh_delay(10);
+    if (eh_r32(g_op + R_USBSTS) & STS_ASS) {
+        serial_puts("EHCI-RING-CHECK: ASS не сбросился; DMA-список не трогаю\n");
+        return false;
+    }
+
+    /* При ASS=0 HC уже не читает qH. Async-список содержит только
+     * временный control-QH; interrupt-QH находятся в periodic frame list. */
+    eh_head[0] = head_phys | 2u;
+    eh_qhc[0]  = head_phys | 2u;
+    eh_w32(g_op + R_ASYNC, head_phys);
+    eh_dma();
+
+    uint32_t readback = eh_r32(g_op + R_ASYNC) & 0xFFFFFFE0u;
+    if (readback != head_phys) {
+        serial_puts("EHCI-RING-CHECK: ASYNCLISTADDR readback mismatch: ");
+        serial_puthex(readback);
+        serial_puts(" expected=");
+        serial_puthex(head_phys);
+        serial_puts("; async оставляю остановленным\n");
+        return false;
+    }
+
+    eh_w32(g_op + R_USBCMD, (oldcmd & ~CMD_IAAD) | CMD_ASE);
+    t = 20000;
+    while (!eh_async_live() && t-- > 0)
+        eh_delay(10);
+    if (!eh_async_live()) {
+        serial_puts("EHCI-RING-CHECK: расписание не поднялось после восстановления, sts=");
+        serial_puthex(eh_r32(g_op + R_USBSTS));
+        serial_puts("\n");
+        return false;
+    }
+    serial_puts("EHCI-RING-CHECK: ASYNCLISTADDR восстановлен и подтверждён\n");
+    return true;
+}
+
 static bool doorbell(void) {
     if (!eh_ensure_async()) return false;   /* звонок в мёртвое кольцо */
+    /* [#495] СНАЧАЛА снять протухший IAA (R/WC), ПОТОМ звонить. Иначе
+     * ожидание лжётся: бит IAA от ПРОШЛОГО звонка (nudge [#488] его не
+     * снимает) читается как «звонок пришёл» — doorbell() возвращает
+     * успех, не позвонив, а IAAD остаётся висеть в USBCMD. Хуже: пока
+     * IAA стоит неподтверждённым, контроллер ПАРКУЕТ обход async-кольца
+     * (EHCI 1.0 §4.8.5: async advance ждёт квитанции статуса) — новые
+     * qH не исполняются, qTD вечно ACTIVE (AMD-фото Сборки 5: на каждом
+     * дампе sts IAA=1 + cmd IAAD=1, GET_DESCRIPTOR не проходит).
+     * Linux ehci-hcd перед iaad_watchdog тоже квитирует статус. */
+    eh_w32(g_op + R_USBSTS, STS_IAA);       /* R/WC: квитанция старого  */
     eh_w32(g_op + R_USBCMD, eh_r32(g_op + R_USBCMD) | CMD_IAAD);
-    int t = 4000;                           /* ~150 мс (реально - мкс)  */
+    int t = 1500;                           /* [#489] ~15 мс: IAA звонит мксами
+                                               (QEMU); AMD FCH не звонит ВООБЩЕ
+                                               — каждый лишний мс здесь платится
+                                               на КАЖДОЙ передаче (фото Сборки 4:
+                                               «doorbell timeout» на каждом
+                                               GET_DESCRIPTOR) */
     while (!(eh_r32(g_op + R_USBSTS) & STS_IAA) && t-- > 0) eh_delay(10);
     eh_w32(g_op + R_USBSTS, STS_IAA);       /* R/WC */
     if (t >= 0) return true;                /* IAA пришёл вовремя       */
@@ -410,20 +565,65 @@ static bool doorbell(void) {
     char nb[8];
     serial_puts(itoa((uint32_t)(g_ei + 1), nb, 10));
     serial_puts("\n");
-    eh_w32(g_op + R_USBCMD, eh_r32(g_op + R_USBCMD) & ~CMD_ASE);
+    uint32_t cmd = eh_r32(g_op + R_USBCMD);
+    cmd &= ~(CMD_ASE | CMD_IAAD);           /* отменить зависший doorbell */
+    eh_w32(g_op + R_USBCMD, cmd);
     int t2 = 4000;
     while ((eh_r32(g_op + R_USBSTS) & STS_ASS) && t2-- > 0) eh_delay(10);
+    if (eh_r32(g_op + R_USBSTS) & STS_ASS) {
+        serial_puts("EHCI: ASS не сбросился после таймаута; список не трогаю\n");
+        return false; /* HC всё ещё может читать DMA-структуры */
+    }
     eh_head[0] = QH_HL_QH(eh_head);         /* каноническое кольцо      */
     eh_dma();
-    eh_w32(g_op + R_USBCMD, eh_r32(g_op + R_USBCMD) | CMD_ASE);
+    eh_w32(g_op + R_USBCMD,
+           (eh_r32(g_op + R_USBCMD) & ~CMD_IAAD) | CMD_ASE);
+    /* [#489] ЭТАП 13: рестарт обязан ПОДНЯТЬ ОСТАНОВЛЕННЫЙ КОНТРОЛЛЕР.
+     * Фото Сборки 4: первая же передача шла в стоящий HC (sts=0xC004,
+     * HALT=1, RS «проглочен»), а рестарт doorbell писал ТОЛЬКО ASE —
+     * мёртвому контроллеру бит расписания безразличен, HC оставался
+     * стоять и все СЛЕДУЮЩИЕ попытки шли в него же. Повторная запись
+     * RS (класс #483 — «повторная запись запускает») поднимает HC;
+     * QEMU сюда не попадает (IAA у него звонит мгновенно). */
+    if (eh_r32(g_op + R_USBSTS) & STS_HALT)
+        eh_w32(g_op + R_USBCMD, eh_r32(g_op + R_USBCMD) | CMD_RS);
     return false;
 }
 
 static bool eh_ctrl_run(int ntd) {
-    /* вставить control-QH в кольцо после головы */
-    eh_qhc[0] = QH_HL_QH(eh_head);
-    eh_head[0] = QH_HL_QH(eh_qhc);
+    /* Сначала проверяем адрес корня; после неудачного IAA реальное железо
+     * могло оставить async остановленным или с неверным ASYNCLISTADDR. */
+    if (!eh_async_root_sanity()) return false;
+
+    /* Явные 32-байтовые DMA-адреса + проверка link topology сразу после
+     * публикации: head -> control-QH -> head. Не полагаемся на один ASS. */
+    uint32_t head_phys = ((uint32_t)&eh_head[0]) & 0xFFFFFFE0u;
+    uint32_t qhc_phys  = ((uint32_t)&eh_qhc[0]) & 0xFFFFFFE0u;
+    eh_qhc[0] = head_phys | 2u;
+    eh_head[0] = qhc_phys | 2u;
     eh_dma();
+    uint32_t async_phys = eh_r32(g_op + R_ASYNC) & 0xFFFFFFE0u;
+    uint32_t head_next = eh_dma32(&eh_head[0]) & 0xFFFFFFE0u;
+    uint32_t qhc_next = eh_dma32(&eh_qhc[0]) & 0xFFFFFFE0u;
+    /* [#484] AMD FCH держит в ASYNCLISTADDR «курсор» обхода (head ИЛИ
+     * qhc) — оба валидны; кольцо обязано быть замкнуто head<->qhc. */
+    if ((async_phys != head_phys && async_phys != qhc_phys) ||
+        head_next != qhc_phys || qhc_next != head_phys) {
+        serial_puts("EHCI-RING-CHECK: неверное кольцо async: async=");
+        serial_puthex(async_phys);
+        serial_puts(" head=");
+        serial_puthex(head_phys);
+        serial_puts(" qhc=");
+        serial_puthex(qhc_phys);
+        serial_puts(" head.next=");
+        serial_puthex(head_next);
+        serial_puts(" qhc.next=");
+        serial_puthex(qhc_next);
+        serial_puts("\n");
+        eh_head[0] = head_phys | 2u;
+        eh_dma();
+        return false;
+    }
     /* [#405] ВСТАВКА — БЕЗ doorbell-гейта: Linux ehci-hcd тоже просто
      * вшивает QH в кольцо (iaa_watchdog нужен только для безопасного
      * ИЗЪЯТИЯ). HC с PARK=0 обходит кольцо непрерывно и подбирает
@@ -438,17 +638,73 @@ static bool eh_ctrl_run(int ntd) {
         return false;
     }
 
-    int t = 4000;                           /* ~200 мс: контрольный     */
-    bool done = false;                      /* трансфер HS идёт единицы */
-    while (t-- > 0) {                       /* мс; ретраев на уровне    */
+    /* [#488] ЭТАП 13: IAAD-«толчок» БЕЗ ожидания IAA. EGOROV.LOG
+     * Сборки 4 (реальный AMD FCH): оверлей контрольного qH КОПИРУЕТСЯ
+     * контроллером (qh6=ACTIVE SETUP в каждом дампе — HC ходит по
+     * кольцу и фетчит!), но транзакция НЕ выпускается (Cerr=3 не
+     * тронут, токен вечно ACTIVE, ASS=0) — припаркованный в
+     * reclamation async-движок не «замечает» вшитый QH. Документированный
+     * механизм побудки — Interrupt-on-Async-Advance Doorbell (EHCI 1.0
+     * §4.8.3): пишем IAAD и НЕ ждём ответа (IAA на этом FCH не звонит
+     * вовсе — #405): звонок заставляет HC пройти кольцо; qH с активным
+     * оверлеем выполняется. Linux бьёт этим же дверным звонком при
+     * каждом unlink (iaa_watchdog). QEMU: IAA звонит мгновенно, бит
+     * снимается R/WC-записью в doorbell() ниже — на e2e не влияет. */
+    /* [#495] квитировать протухший IAA ДО звона надгон-двери: парковка
+     * async-обхода по неподтверждённому IAA (§4.8.5) не допускает
+     * обработки нового IAAD — qH вставлен, но никогда не исполнится. */
+    eh_w32(g_op + R_USBSTS, STS_IAA);       /* R/WC */
+    eh_w32(g_op + R_USBCMD, eh_r32(g_op + R_USBCMD) | CMD_IAAD);
+
+    bool done = false;
+    int mode = 1;                          /* 1 = связный qH (обычный путь) */
+    int t = 2000;                          /* фаза 1: ~100 мс на связном qH */
+    while (t-- > 0) {
         eh_dma();                           /* [#429] токен пишет HC — читаем из ОЗУ, не из кэша: иначе строка
                                                «вечно ACTIVE» → xfer timeout на КАЖДОЙ передаче (остаток #332) */
         if (!(eh_dma32(&eh_ctd[ntd - 1].token) & QTD_ACTIVE)) { done = true; break; }
+        /* [#495] надгон-звонок звонит и в ожидании: квитируем IAA сразу,
+         * иначе обход кольца паркуется и наш qH не исполняется. */
+        if (eh_r32(g_op + R_USBSTS) & STS_IAA) eh_w32(g_op + R_USBSTS, STS_IAA);
         eh_delay(50);
+    }
+    if (!done) {
+        /* [#488] ФАЗА 2 (фоллбэк реального железа): перенос qTD-цепочки
+         * на оверлей ГОЛОВЫ кольца (qH с H=1). По показаниям Сборки 4
+         * AMD FCH фетчит оверлеи при обходе, но не стартует транзакцию
+         * со ВШИТОГО qH; работа НА ГОЛОВЕ (H=1) — каноническая форма
+         * «разбудить reclamation»: голова — единственный qH, который
+         * припаркованный HC обязан мониторить (EHCI 1.0 §4.8.3).
+         * Голова уже имеет форму addr=0/ep=0/HS/MPS=64; переносим
+         * РЕАЛЬНЫЕ характеристики цели (epchar qH) + H=1. Кольцо
+         * замыкается сама-на-себя, звеним IAAD ещё раз. QEMU сюда не
+         * попадает: у него фаза 1 завершается за микросекунды. */
+        mode = 2;
+        serial_puts("EHCI: [#488] связный qH молчит 100 мс - перенос цепочки на ГОЛОВУ кольца (H=1)\n");
+        eh_head[0] = QH_HL_QH(eh_head);            /* кольцо: сама на себя */
+        eh_head[1] = eh_dma32(&eh_qhc[1]) | QH_H;  /* эпары цели + головной H */
+        eh_head[2] = eh_dma32(&eh_qhc[2]);
+        eh_head[3] = 0;
+        eh_head[4] = QH_HL_TD(&eh_ctd[0]);         /* Next qTD -> SETUP     */
+        eh_head[5] = QTD_END;
+        for (int i = 6; i < 16; i++) eh_head[i] = 0;   /* оверлей чист — HC сам фетчит */
+        eh_qhc[6] = 0;                             /* qH-контроль гасим (токен)  */
+        eh_dma();
+        eh_w32(g_op + R_USBSTS, STS_IAA);         /* [#495] квитанция до звона */
+        eh_w32(g_op + R_USBCMD, eh_r32(g_op + R_USBCMD) | CMD_IAAD);
+        t = 2000;                                  /* фаза 2: ещё ~100 мс */
+        while (t-- > 0) {
+            eh_dma();
+            if (!(eh_dma32(&eh_ctd[ntd - 1].token) & QTD_ACTIVE)) { done = true; break; }
+            if (eh_r32(g_op + R_USBSTS) & STS_IAA) eh_w32(g_op + R_USBSTS, STS_IAA); /* [#495] */
+            eh_delay(50);
+        }
     }
     if (!done) {
         serial_puts("EHCI-DBG: xfer timeout inst=");
         serial_puthex((uint32_t)g_ei);
+        serial_puts(" mode=");
+        serial_puthex((uint32_t)mode);
         serial_puts(" cmd=");
         serial_puthex(eh_r32(g_op + R_USBCMD));
         serial_puts(" sts=");
@@ -467,6 +723,10 @@ static bool eh_ctrl_run(int ntd) {
         serial_puthex(eh_dma32(&eh_qhc[4]));
         serial_puts(" qh6=");
         serial_puthex(eh_dma32(&eh_qhc[6]));
+        serial_puts(" hq4=");
+        serial_puthex(eh_dma32(&eh_head[4]));
+        serial_puts(" hq6=");
+        serial_puthex(eh_dma32(&eh_head[6]));
         serial_puts(" td0=");
         serial_puthex(eh_dma32(&eh_ctd[0].token));
         serial_puts(" td1=");
@@ -474,14 +734,23 @@ static bool eh_ctrl_run(int ntd) {
         serial_puts(" td2=");
         serial_puthex(eh_dma32(&eh_ctd[2].token));
         serial_puts("\n");
+        /* [#494] МЕГА-ЛОГ: расшифровка битов cmd/sts той же строкой + TS */
+        serial_puts("EHCI-DBG: ");
+        ud_ehci_status_bits(eh_r32(g_op + R_USBCMD), eh_r32(g_op + R_USBSTS));
+        serial_puts(" [#493]\n");
+        ud_ts("EHCI: таймаут передачи (порт — в строках выше)");
     }
     bool ok = done;
     eh_dma();                               /* [#429] свежие токены ВСЕХ стадий */
     for (int i = 0; i < ntd; i++)
         if (eh_dma32(&eh_ctd[i].token) & (QTD_ERRM | QTD_HALT)) ok = false;
 
-    /* вынуть control-QH из кольца */
+    /* вынуть control-QH из кольца; ГОЛОВУ вернуть в канонический idle
+     * (фаза 2 [#488] могла оставить на ней эпары цели и цепочку) */
     eh_head[0] = QH_HL_QH(eh_head);
+    eh_head[1] = QH_EPCHAR(0, 0, 2, 64);    /* H=1: голова, addr0, HS, MPS64 */
+    eh_head[3] = QTD_END; eh_head[4] = QTD_END; eh_head[5] = QTD_END;
+    for (int i = 6; i < 16; i++) eh_head[i] = 0;
     eh_dma();
     /* G2 #227: при таймауте рестарт внутри doorbell сам вернул кольцо
      * в каноническое состояние и поднял ASE — на ИСХОД уже ЗАВЕРШИВШЕЙСЯ
@@ -509,10 +778,14 @@ static bool eh_ctrl(uint8_t addr, uint8_t mps, uint8_t bm, uint8_t req,
      * урезается, а не переполняет буфер (и memcpy ниже). */
     if (wlen > sizeof(eh_data)) wlen = (uint16_t)sizeof(eh_data);
 
-    /* Адрес/скорость/mps уже стоят в eh_qhc[1]/[2]: их ставит eh_ctrl_dev.
-     * Здесь только чистка оверлея (токен неактивен) и голова TD-цепочки. */
-    for (int i = 4; i < 16; i++) eh_qhc[i] = 0;
-    eh_qhc[3] = QH_HL_TD(&eh_ctd[0]);
+    /* Current qTD и рабочая часть overlay принадлежат контроллеру.
+     * До запуска ПО задаёт только Next qTD = первый TD цепочки.
+     * Предзаполнение Current/ACTIVE overlay обходило нормальный fetch QH
+     * и ломало control transfer на некоторых EHCI-контроллерах.
+     */
+    for (int i = 3; i < 16; i++) eh_qhc[i] = 0;
+    eh_qhc[4] = QH_HL_TD(&eh_ctd[0]);
+    eh_qhc[5] = QTD_END;
 
     memset(&eh_ctd[0], 0, sizeof(eh_ctd));
     /* SETUP: 8 байт, DATA0 */
@@ -553,13 +826,9 @@ static bool eh_ctrl(uint8_t addr, uint8_t mps, uint8_t bm, uint8_t req,
         qtd_bufs(&eh_ctd[1], (uint32_t)eh_data);
         ntd = 2;
     }
-    eh_dma();
-    /* Оверлей control-QH = копия ПЕРВОГО qTD (токен ACTIVE!), как
-     * qh_refresh() в Linux. */
-    eh_qhc[4] = eh_ctd[0].next;
-    eh_qhc[5] = eh_ctd[0].alt;
-    eh_qhc[6] = eh_ctd[0].token;
-    for (int k = 0; k < 5; k++) eh_qhc[7 + k] = eh_ctd[0].buf[k];
+    /* TD-цепочка готова. Overlay остаётся очищенным, а Next qTD указывает
+     * на SETUP TD. Контроллер сам загрузит Current/Token/буферы при fetch.
+     */
     eh_dma();
     bool ok = eh_ctrl_run(ntd);
     if (ok && wlen > 0 && data && (bm & 0x80)) {
@@ -757,6 +1026,58 @@ static bool eh_find_hid(const uint8_t *cfg, uint16_t total,
 }
 
 /* ── перечислить устройство на порту p (скорость уже известна) ── */
+/* [#494] сташ дескриптора для строк ПОСЛЕ бинда + сам дамп строк */
+static uint8_t g_eh_last_dd[EH_NINST][18];
+static uint8_t g_eh_last_dd_port[EH_NINST];
+
+/* [#494] СТРОКИ устройства (EHCI): язык → iManuf/iProd/iSer. Вызывается
+ * ТОЛЬКО ПОСЛЕ полного перечисления (SET_CONFIG + arm interrupt-EP):
+ * строковый запрос QEMU-девайсы вешают — во время перечисления он убивал
+ * GET_CONFIG (e2e T2), после бинда EP0 уже не критичен. Первый неудавшийся
+ * запрос — стоп (дальше не спрашиваем). */
+static void eh_dump_strings(eh_dev_t *d, uint8_t p) {
+    uint8_t sb[64];
+    const uint8_t *dd = g_eh_last_dd[g_ei];
+    if (g_eh_last_dd_port[g_ei] != p || !d || !d->alive) return;
+    memset(sb, 0, sizeof(sb));
+    if (!eh_ctrl_dev(d, d->mps0 ? d->mps0 : 64, 0x80, 0x06, 0x0300u, 0, 4, sb)) {
+        serial_puts("USB-STR: [EHCI#");
+        { char nb[8]; serial_puts(itoa((uint32_t)(g_ei + 1), nb, 10)); }
+        serial_puts(" порт ");
+        { char nb[8]; serial_puts(itoa((uint32_t)p, nb, 10)); }
+        serial_puts("] язык не прочитан - строки пропускаю (норма)\n");
+        return;
+    }
+    uint16_t lang = (uint16_t)(sb[2] | ((uint16_t)sb[3] << 8));
+    static const char *names[3] = { "производитель", "продукт", "серийный №" };
+    uint8_t idxs[3];
+    idxs[0] = dd[14]; idxs[1] = dd[15]; idxs[2] = dd[16];
+    for (int si = 0; si < 3; si++) {
+        if (idxs[si] == 0) continue;
+        memset(sb, 0, sizeof(sb));
+        if (!eh_ctrl_dev(d, d->mps0 ? d->mps0 : 64, 0x80, 0x06,
+                         (uint16_t)(0x0300u | (uint32_t)idxs[si]) /* [#496] wValue: тип<<8|индекс (было наоборот!) */,
+                         lang, 64, sb)) {
+            serial_puts("USB-STR: [EHCI#");
+            { char nb[8]; serial_puts(itoa((uint32_t)(g_ei + 1), nb, 10)); }
+            serial_puts(" порт ");
+            { char nb[8]; serial_puts(itoa((uint32_t)p, nb, 10)); }
+            serial_puts("] ");
+            serial_puts(names[si]);
+            serial_puts(" — нет строки (норма, дальше не спрашиваю)\n");
+            break;
+        }
+        serial_puts("USB-STR: [EHCI#");
+        { char nb[8]; serial_puts(itoa((uint32_t)(g_ei + 1), nb, 10)); }
+        serial_puts(" порт ");
+        { char nb[8]; serial_puts(itoa((uint32_t)p, nb, 10)); }
+        serial_puts("] ");
+        serial_puts(names[si]);
+        serial_puts(": ");
+        ud_str_desc(sb, 64);
+    }
+}
+
 static void eh_enum_dev(uint8_t p, uint8_t spd) {
     eh_dev_t tmp;
     memset(&tmp, 0, sizeof(tmp));
@@ -809,6 +1130,25 @@ static void eh_enum_dev(uint8_t p, uint8_t spd) {
     tmp.vid = (uint16_t)(dd[8] | ((uint16_t)dd[9] << 8));
     tmp.pid = (uint16_t)(dd[10] | ((uint16_t)dd[11] << 8));
 
+    /* [#494] МЕГА-ЛОГ (EHCI): девайс-дескриптор + TS; дескриптор сташен
+     * для строк ПОСЛЕ бинда (см. eh_dump_strings у хвоста успеха):
+     * строковый запрос QEMU-девайсы вешают — во время перечисления он
+     * ронял GET_CONFIG (e2e T2), после бинда EP0 уже не критичен. */
+    {
+        char wl[26]; int wn = 0;
+        { const char *s = "EHCI#"; while (*s) wl[wn++] = *s++; }
+        { char nb[8]; const char *s = itoa((uint32_t)(g_ei + 1), nb, 10);
+          while (*s && wn < 20) wl[wn++] = *s++; }
+        { const char *s = " порт "; while (*s && wn < 24) wl[wn++] = *s++; }
+        { char nb[8]; const char *s = itoa((uint32_t)p, nb, 10);
+          while (*s && wn < 25) wl[wn++] = *s++; }
+        wl[wn] = 0;
+        memcpy(g_eh_last_dd[g_ei], dd, 18);
+        g_eh_last_dd_port[g_ei] = p;
+        ud_dev_desc(wl, dd, 18);
+        /* ud_ts убран для бисекта */
+    }
+
     uint8_t cfg9[9];
     memset(cfg9, 0, sizeof(cfg9));
     if (!eh_ctrl_dev(&tmp, mps, 0x80, 0x06, 0x0200, 0, 9, cfg9)) {
@@ -849,6 +1189,19 @@ static void eh_enum_dev(uint8_t p, uint8_t spd) {
         goto out_free;
     }
     if (g_rxlen < total) total = g_rxlen;
+
+    /* [#494] МЕГА-ЛОГ (EHCI): конфиг-дескриптор целиком */
+    {
+        char wl[26]; int wn = 0;
+        { const char *s = "EHCI#"; while (*s) wl[wn++] = *s++; }
+        { char nb[8]; const char *s = itoa((uint32_t)(g_ei + 1), nb, 10);
+          while (*s && wn < 20) wl[wn++] = *s++; }
+        { const char *s = " порт "; while (*s && wn < 24) wl[wn++] = *s++; }
+        { char nb[8]; const char *s = itoa((uint32_t)p, nb, 10);
+          while (*s && wn < 25) wl[wn++] = *s++; }
+        wl[wn] = 0;
+        ud_cfg_desc(wl, cfg, total);
+    }
 
     uint8_t m_if = 0, m_ep = 0, m_mps = 0, k_if = 0, k_ep = 0, k_mps = 0;
     if (!eh_find_hid(cfg, total, &m_if, &m_ep, &m_mps, &k_if, &k_ep, &k_mps)) {
@@ -939,6 +1292,8 @@ static void eh_enum_dev(uint8_t p, uint8_t spd) {
 
     usbmap_pick(0x20, d->role == 1 ? "mouse" : "keyboard", p, "2.0");
     eh_diag_set("устройство готово");
+    /* [#494] СТРОКИ — после бинда: сбой EP0 уже не роняет устройство */
+    eh_dump_strings(d, p);   /* [#494] строки после бинда; IAA-фикс [#495] убрал их зависание */
     return;                    /* успех: адрес закреплён за слотом      */
 
 out_free:
@@ -988,6 +1343,7 @@ static void eh_port_service(uint8_t p, int force) {
                 eh_kill_dev(&g_dv[i], "CCS пропал (CSC пропущен)");
         g_conn[p] = false;
         g_fail[p] = 0;
+        if (p < 16) g_route_cool[p] = 0;   /* [#485] порт пуст — можно маршрутизировать сразу */
         return;
     }
 
@@ -1003,6 +1359,7 @@ static void eh_port_service(uint8_t p, int force) {
                     eh_kill_dev(&g_dv[i], "CSC");
             g_conn[p] = false;          /* G2 #264: кэш conn-состояния  */
             g_fail[p] = 0;
+            if (p < 16) g_route_cool[p] = 0;   /* [#485] см. выше */
             /* G2 #271: «стойкие» контроллеры держат PED=1 после
              * disconnect (большинство сбрасывает его само). Кто не
              * сбросил за 10 мс — гасим явно: пишем ТЕКУЩЕЕ значение
@@ -1048,6 +1405,15 @@ static void eh_port_service(uint8_t p, int force) {
 
     /* подключено, но НЕ наше: 3 неудачи — ждём переподключения */
     if (g_fail[p] >= 3) return;
+    /* [#490] ЭТАП 13: порт недавно отдан компаньону (cooldown) — НЕ
+     * трогаем и НЕ ресетим: возможно, чипсет уже вернул его нам (PO
+     * слетел — см. ниже), но повторная маршрутизация подождёт конца
+     * cooldown. Раньше этот порт молотился ресетом+перечислением
+     * каждую секунду, пока счётчик неудач не ставил его намертво. */
+    if (g_route_cool[p] > 0) {
+        eh_w32(pa, v | PS_CSC | PS_PEC | PS_OCC);
+        return;
+    }
     if (!force) {
         /* не стартовый обход и не CSC: это рескан-попытка (см.
          * ehci_rescan_unclaimed) — печатаем, чтобы было видно в журнале */
@@ -1058,12 +1424,43 @@ static void eh_port_service(uint8_t p, int force) {
 
     /* low-speed-устройство (Line Status = K) отдаём компаньону СРАЗУ и
      * БЕЗ порта-реста: EHCI-спека §4.2 прямо требует не гнать
-     * high-speed-рест в LS-линию. */
+     * high-speed-рест в LS-линию.
+     * [#485] ЭТАП 11: ЗДЕСЬ БЫЛ ШТОРМ. Запись (v&~CSC…)|PO|PP гасила
+     * change-биты ЗАПИСЬЮ НУЛЕЙ — для R/WC-битов это no-op, CSC
+     * оставался взведённым, а AMD FCH к тому же сам сбрасывает PO при
+     * активности компаньона: рескан каждую секунду снова приходил
+     * сюда, снова писал PO → «release» → OHCI видел CSC → сбрасывал
+     * порт и перечислял живое устройство ЗАНОВО (фото Сборки 3:
+     * «обнаружено новое устройство» по портам 4/5 каждую секунду).
+     * Теперь: 1) change-биты гасим записью ЕДИНИЦ (w1c); 2) порт с
+     * живым устройством у компаньона НЕ перемаршрутизируем вовсе;
+     * 3) повторная маршрутизация — не чаще раза в 5 с (cooldown).
+     * [#490] ЭТАП 13, КРИТИЧЕСКИЙ (EGOROV.LOG Сборки 4): маршрутизация
+     * должна быть САМОВОССТАНАВЛИВАЮЩЕЙСЯ. HCR-сброс OHCI-компаньона
+     * при его инициализации (mouse_hw_init_ohci, сразу после ehci_init)
+     * сбрасывает мультиплексор портов — PO слетает в 0, гнёзда
+     * возвращаются EHCI, а OHCI ничего не видит (его порты 0x100).
+     * Прежняя логика: отпустил на старте → PO слетел → «не заявлено» →
+     * 3 неудачи за время cooldown → «жду переподключения» НАВСЕГДА —
+     * мышь/клава LS в гнёздах 2.0 МЕРТВЫ (фото: EHCI#2 порты 4/5).
+     * Теперь: PO=0 + линия K + компаньон есть → ОТПУСКАЕМ ЗАНОВО
+     * (не реже раза в 5 с): мультиплексор восстанавливается, OHCI
+     * видит CSC и перечисляет устройство. Счётчик неудач при
+     * маршрутизации обнуляем — это НЕ неудача перечисления. */
     if (((v >> 10) & 3u) == 1u && g_have_companion) {
+        if (ohci_companion_claimed(g_mybd[0], g_mybd[1], g_mybd[2], (int)p)) {
+            /* компаньон уже владеет устройством: молча чистим биты */
+            eh_w32(pa, v | PS_CSC | PS_PEC | PS_OCC);
+            return;
+        }
         serial_puts("EHCI: порт ");
         serial_puthex(p);
-        serial_puts(": low-speed устройство - компаньону (без сброса)\n");
-        eh_w32(pa, (v & ~(PS_CSC | PS_PEC | PS_OCC)) | PS_PO | PS_PP);
+        serial_puts(": low-speed устройство - компаньону (без сброса)");
+        ud_ehci_port_bits(v);               /* [#494] расшифровка битов */
+        serial_puts("\n");
+        eh_w32(pa, v | PS_CSC | PS_PEC | PS_OCC | PS_PO | PS_PP);
+        if (p < 16) g_route_cool[p] = 5;
+        g_fail[p] = 0;                     /* [#490] маршрутизация ≠ неудача */
         eh_diag_set("LS - компаньону (без сброса)");
         return;
     }
@@ -1073,14 +1470,17 @@ static void eh_port_service(uint8_t p, int force) {
      * «как есть» — устройство молчало. Теперь ЛЮБОЙ ненаш порт получает
      * честный port reset: устройство возвращается на адрес 0. */
     if (!(v & PS_PP)) {
-        eh_w32(pa, (v & ~(PS_CSC | PS_PEC | PS_OCC)) | PS_PP);
+        /* [#485] w1c: change-биты гасим записью ЕДИНИЦ */
+        eh_w32(pa, v | PS_PP | PS_CSC | PS_PEC | PS_OCC);
         /* F2-8: 100 мс (было 20) — часть EHCI (VIA) поднимает питание
          * порта до 100 мс: раньше порт читался «пусто» и устройство
          * сразу попадало в 3-попыточный бэкофф. */
         kdelay_ms(100);
         v = eh_r32(pa);
     }
-    eh_w32(pa, (v & ~(PS_CSC | PS_PEC | PS_OCC)) | PS_PR);
+    /* [#485] w1c: change-биты — записью ЕДИНИЦ (прежде (v&~CSC…)|PR
+     * писал нули в R/WC-биты — они оставались взведёнными навсегда) */
+    eh_w32(pa, v | PS_PR | PS_CSC | PS_PEC | PS_OCC);
     int t = 5000;                       /* F2-9: ~500 мс (было 250): Intel
                                            снимает PR до 200 мс — было
                                            впритык; 500 мс — как Linux */
@@ -1088,7 +1488,7 @@ static void eh_port_service(uint8_t p, int force) {
     /* Реальный HC снимает PR сам; QEMU ждёт записи гостя. */
     v = eh_r32(pa);
     if (v & PS_PR)
-        eh_w32(pa, v & ~(PS_CSC | PS_PEC | PS_OCC | PS_PR));
+        eh_w32(pa, (v | PS_CSC | PS_PEC | PS_OCC) & ~PS_PR);  /* [#485] w1c; PR=0 - для QEMU */
     eh_delay(50000);                    /* recovery                    */
     v = eh_r32(pa);
     if (!(v & PS_CCS)) {
@@ -1098,7 +1498,10 @@ static void eh_port_service(uint8_t p, int force) {
     if (v & PS_PED) {
         serial_puts("EHCI: порт ");
         serial_puthex(p);
-        serial_puts(": устройство high-speed, перечисляю\n");
+        serial_puts(": устройство high-speed, перечисляю");
+        ud_ehci_port_bits(v);               /* [#494] расшифровка битов */
+        serial_puts("\n");
+        ud_ts("EHCI: начало перечисления HS-устройства (порт выше)");
         eh_enum_dev(p, 2);
         for (int i = 0; i < EH_NDEV; i++)
             if (g_dv[i].used && g_dv[i].alive && g_dv[i].port == p)
@@ -1124,7 +1527,9 @@ static void eh_port_service(uint8_t p, int force) {
         serial_puts(": устройство full/low-speed - отдаю компаньону (N_CC=");
         { char nb[8]; serial_puts(itoa((uint32_t)g_ncc, nb, 10)); }
         serial_puts(")\n");
-        eh_w32(pa, (v & ~(PS_CSC | PS_PEC | PS_OCC)) | PS_PO | PS_PP);
+        eh_w32(pa, v | PS_CSC | PS_PEC | PS_OCC | PS_PO | PS_PP);   /* [#485] w1c */
+        if (p < 16) g_route_cool[p] = 5;   /* не дёргать компаньона 5 с */
+        g_fail[p] = 0;                     /* [#490] маршрутизация ≠ неудача */
         eh_diag_set("FS/LS - компаньону");
     } else {
         serial_puts("EHCI: порт ");
@@ -1151,6 +1556,8 @@ static void eh_ports_poll(int force) {
 static void ehci_rescan_unclaimed(void) {
     if (!g_running) return;
     for (uint8_t p = 1; p <= g_nports && p < 16; p++) {
+        /* [#485] тикаем cooldown маршрутизации раз в проход (~1 с) */
+        if (g_route_cool[p] > 0) g_route_cool[p]--;
         if (g_fail[p] >= 3) continue;
         bool mine = false;
         for (int i = 0; i < EH_NDEV; i++)
@@ -1161,6 +1568,16 @@ static void ehci_rescan_unclaimed(void) {
         if (!(v & PS_CCS)) { g_fail[p] = 0; continue; }
         if (v & PS_CSC) { eh_port_service(p, 0); continue; }
         eh_port_service(p, 0);                /* nенаш - ещё попытка     */
+        /* [#490] ЭТАП 13: маршрутизация к компаньону — НЕ неудача
+         * перечисления. Если порт УЖЕ у компаньона (PO=1 — сервис его
+         * только что отпустил) или его линия K (LS ждёт повторной
+         * маршрутизации из-за слетевшего PO) — счётчик не тикает.
+         * Иначе 3 «неудачи» набегали за 5 с cooldown (пока порт ждал
+         * повторной маршрутизации), и LS-гнёзда умирали НАВСЕГДА
+         * (EGOROV.LOG Сборки 4: EHCI#2 порты 4/5 «жду переподключения»). */
+        uint32_t v2 = eh_r32(g_op + R_PORTSC + 4u * (uint32_t)(p - 1));
+        if (v2 & PS_PO) { g_fail[p] = 0; continue; }
+        if (((v2 >> 10) & 3u) == 1u && g_have_companion) continue;
         bool ok = false;
         for (int i = 0; i < EH_NDEV; i++)
             if (g_dv[i].used && g_dv[i].alive && g_dv[i].port == p) ok = true;
@@ -1171,6 +1588,42 @@ static void ehci_rescan_unclaimed(void) {
             serial_puts(": не перечислился за 3 попытки - жду переподключения\n");
         }
     }
+}
+
+/* [#490] ЭТАП 13: разовая ПОВТОРНАЯ МАРШРУТИЗАЦИЯ LS-гнёзд к компаньонам.
+ * Вызывается из kernel.c СРАЗУ ПОСЛЕ mouse_hw_init_ohci(): HCR-сброс
+ * OHCI-компаньона при его инициализации сбрасывает мультиплексор
+ * EHCI↔OHCI — PortOwner, поставленный ehci_init СЕКУДУ НАЗАД, слетает,
+ * LS-устройства (мышь/клава в гнёздах USB 2.0) остаются на EHCI-стороне,
+ * куда EHCI-драйвер добраться не может (EHCI не говорит по-линии 1.5
+ * Мбит/с). Здесь мы ЛЕГКО (без порта-ресета, без перечисления —
+ * маршрутизация не трогает шину) переподнимаем PO на всех LS-портах,
+ * у которых PO читается 0. Секундный рескан дальше подхватит то же
+ * правило самовосстановления (#490 в eh_port_service) — на случай,
+ * если мультиплексор слетит ещё раз в процессе жизни. */
+void ehci_companion_reroute(void) {
+    for (int i = 0; i < EH_NINST; i++) {
+        if (g_mmio_a[i] == 0 || !g_running_a[i]) continue;
+        g_ei = i;
+        for (uint8_t p = 1; p <= g_nports && p <= 15; p++) {
+            uint32_t pa = g_op + R_PORTSC + 4u * (uint32_t)(p - 1);
+            uint32_t v = eh_r32(pa);
+            if (v & PS_PO) continue;                 /* уже у компаньона */
+            if (!(v & PS_CCS)) continue;             /* пусто            */
+            if (((v >> 10) & 3u) != 1u) continue;    /* не LS            */
+            if (!g_have_companion) continue;
+            if (ohci_companion_claimed(g_mybd[0], g_mybd[1], g_mybd[2], (int)p))
+                continue;                             /* живое у компаньона */
+            serial_puts("EHCI: [#490] повторная маршрутизация LS порт ");
+            serial_puthex(p);
+            serial_puts(" (PO слетел после HCR компаньона)\n");
+            eh_w32(pa, v | PS_CSC | PS_PEC | PS_OCC | PS_PO | PS_PP);
+            if (p < 16) g_route_cool[p] = 5;
+            g_fail[p] = 0;
+            eh_diag_set("LS - компаньону (повторно, #490)");
+        }
+    }
+    g_ei = 0;
 }
 
 /* ── разобрать interrupt-IN отчёт устройства ── */
@@ -1277,6 +1730,9 @@ static bool eh_init_one(uint8_t bus, uint8_t dev, uint8_t fn, int force_usb) {
     serial_puts(" (это ");
     serial_puts(eh_bus_label());
     serial_puts(")\n");
+    /* [#485] ЭТАП 11: PCI-адрес ЭТОГО инстанса (по g_ei) — для сверки
+     * с OHCI-компаньоном при маршрутизации Port Owner. */
+    g_mybd[0] = bus; g_mybd[1] = dev; g_mybd[2] = fn;
 
     uint32_t bar = pci_read32(bus, dev, fn, 0x10);
     if (bar & 1u) { serial_puts("EHCI: BAR0 - I/O, пропускаю\n"); return false; }
@@ -1316,10 +1772,20 @@ static bool eh_init_one(uint8_t bus, uint8_t dev, uint8_t fn, int force_usb) {
     /* halt + reset */
     eh_w32(g_op + R_USBCMD, eh_r32(g_op + R_USBCMD) & ~CMD_RS);
     int t = 20000;
+    /* [#481]: здесь теперь ЧЕСТНЫЙ HCHalted (бит 15). QEMU может не
+     * выставлять его вовсе — таймаут молча съедает 200 мс и едем дальше
+     * (безопасно: HCRESET ниже всё равно останавливает контроллер). */
     while (!(eh_r32(g_op + R_USBSTS) & STS_HALT) && t-- > 0) eh_delay(10);
     eh_w32(g_op + R_USBCMD, CMD_HCR);
-    t = 2000;
-    while ((eh_r32(g_op + R_USBCMD) & CMD_HCR) && t-- > 0) eh_delay(10);
+    /* [#483] ЭТАП 11: 250 мс (было 20!) — как Linux ehci_reset(). HCR
+     * реального AMD FCH снимается ДОЛЬШЕ 20 мс: прежний таймаут уходил
+     * СРЕДИ reset, следующие записи USBCMD/списков «прилипали» к
+     * регистрам, но запуск RS мог быть проглочен — контроллер оставался
+     * стоять при USBCMD.RS=1 (фото Сборки 3: cmd=0x00080B31 sts=0xC004
+     * HCHalted=1). Пока HCR=1 — ждем, Register writes в середине reset
+     * имеют неопределённый эффект. */
+    t = 2500;
+    while ((eh_r32(g_op + R_USBCMD) & CMD_HCR) && t-- > 0) eh_delay(100);
 
     /* число портов — из HCSPARAMS (КАПАБИЛИТИ-регистры, mm+4) */
     uint32_t hcs = eh_r32(g_mm + 0x04u);
@@ -1341,9 +1807,16 @@ static bool eh_init_one(uint8_t bus, uint8_t dev, uint8_t fn, int force_usb) {
                                         ПОСЛЕ HCRESET и ДО USBCMD.RUN */
     eh_w32(g_op + R_FRINDEX, 0);
     eh_w32(g_op + R_PERIODIC, (uint32_t)eh_fl);
-    eh_w32(g_op + R_ASYNC, (uint32_t)eh_head);
+    eh_w32(g_op + R_ASYNC, ((uint32_t)&eh_head[0]) & 0xFFFFFFE0u);
     eh_w32(g_op + R_USBINTR, 0);
     eh_dma();
+    serial_puts("EHCI-RING-CHECK: runtime head=");
+    serial_puthex(((uint32_t)&eh_head[0]) & 0xFFFFFFE0u);
+    serial_puts(" qhc=");
+    serial_puthex(((uint32_t)&eh_qhc[0]) & 0xFFFFFFE0u);
+    serial_puts(" ASYNCLISTADDR=");
+    serial_puthex(eh_r32(g_op + R_ASYNC) & 0xFFFFFFE0u);
+    serial_puts("\n");
 
     for (int i = 0; i < EH_NDEV; i++) { g_dv[i].used = false; g_dv[i].alive = false; }
     for (int i = 0; i < 16; i++) g_fail[i] = 0;
@@ -1359,7 +1832,24 @@ static bool eh_init_one(uint8_t bus, uint8_t dev, uint8_t fn, int force_usb) {
     eh_w32(g_op + R_USBSTS, 0x3Fu);   /* R/WC: сброс чужих статусов (IAA!) */
     eh_w32(g_op + R_USBCMD, eh_r32(g_op + R_USBCMD) | CMD_RS | CMD_PSE | CMD_ASE);
     eh_delay(10000);
-    if (!(eh_r32(g_op + R_USBSTS) & STS_HALT)) {
+    /* [#483] ЭТАП 11: честный handshake запуска. Живость = поднятое
+     * расписание (AMD: RECL на пустом кольце; QEMU: ASS зеркалит ASE)
+     * ИЛИ сброшенный HCHalted. HALT=1 при молчащих расписаниях = RS
+     * «проглочен» (затянувшийся HCRESET, фото Сборки 3) — пишем RS ЕЩЁ
+     * РАЗ (повторная запись запускает контроллер — единственный выход
+     * из состояния «cmd RS=1, sts HCHalted=1»). Прежняя проверка
+     * «работает = бит12==0» читала ASS пустого кольца — пустая была
+     * проверка: пропускала и мёртвый контроллер. */
+    if (!eh_async_live() && (eh_r32(g_op + R_USBSTS) & STS_HALT)) {
+        eh_w32(g_op + R_USBCMD, eh_r32(g_op + R_USBCMD) | CMD_RS);
+        int t2 = 10000;               /* ~100 мс на старт            */
+        while (!eh_async_live() &&
+               (eh_r32(g_op + R_USBSTS) & STS_HALT) && t2-- > 0)
+            eh_delay(10);
+        if (eh_async_live() || !(eh_r32(g_op + R_USBSTS) & STS_HALT))
+            serial_puts("EHCI: [#483] повторный RS поднял остановленный контроллер\n");
+    }
+    if (eh_async_live() || !(eh_r32(g_op + R_USBSTS) & STS_HALT)) {
         serial_puts("EHCI: контроллер работает (порты ещё у компаньонов)\n");
     } else {
         serial_puts("EHCI: контроллер не завёлся - порты остаются у компаньонов\n");
@@ -1437,6 +1927,11 @@ static bool eh_init_one(uint8_t bus, uint8_t dev, uint8_t fn, int force_usb) {
 }
 
 bool ehci_init(int fb_w, int fb_h, int force_usb) {
+    /* Диагностическая метка: подтверждает, что в образ вошёл патч qH/qTD.
+     * Номер версии Egorov OS намеренно не меняем. */
+    serial_puts("EHCI-FIX-CHECK: qH overlay cleared; first qTD via Next; "
+                "HALT kills liveness (#487); IAAD nudge + head-overlay (#488); "
+                "restart lifts RS (#489); routing self-heal (#490)\n");
     /* СМАЗ-защита: флаг «уже запущено» с магией, а не простой int -
      * ОЗУ под статиками до явной инициализации не обязана быть нулём. */
     static uint32_t done_magic;
@@ -1454,6 +1949,8 @@ bool ehci_init(int fb_w, int fb_h, int force_usb) {
         memset(g_fail, 0, sizeof(g_fail));
         memset(eh_addr_bm, 0, sizeof(eh_addr_bm));
         memset(g_conn, 0, sizeof(g_conn));
+        memset(g_route_cool, 0, sizeof(g_route_cool));   /* [#485] */
+        memset(g_mybd_a[i], 0, sizeof(g_mybd_a[i]));     /* [#485] */
         g_rxlen = 0;
         for (int k = 0; k < EH_NDEV; k++) { g_dv[k].used = false; g_dv[k].alive = false; }
     }
@@ -1700,10 +2197,18 @@ void ehci_portmap(int *ctrls, int *lports, int *devs_bound, int *eh_ports,
                 if (g_dv_a[i][k].used && g_dv_a[i][k].port == p &&
                     g_dv_a[i][k].alive)
                     role = (int)g_dv_a[i][k].role;
-            uint32_t spd = (pv >> 26) & 3u;
+            /* [#491] ЭТАП 13: скорость по ЧЕСТНЫМ полям EHCI. Прежний
+             * декод (pv>>26)&3 — это поле PSPD из xHCI, у EHCI его НЕТ:
+             * карта писала «full-speed» для LS-мыши (EGOROV.LOG Сборки 4:
+             * ГНЕЗДО №13/№14 «full-speed 12 Мбит/с» при линии K). У EHCI:
+             * PED=1 после сброса = high-speed (спека §4.2, chirp handsh-
+             * ake); иначе скорость видна по Line Status (биты 11:10):
+             * 01=K → low-speed, 10=J → full-speed. */
+            const char *spdstr = (pv & PS_PED) ? "high-speed 480 Мбит/с" :
+                ((((pv >> 10) & 3u) == 1u) ? "low-speed 1.5 Мбит/с"
+                                           : "full-speed 12 Мбит/с");
             serial_puts("USB-КАРТА:   состояние: ");
-            serial_puts(spd == 2 ? "high-speed 480 Мбит/с" :
-                        (spd == 0 ? "full-speed 12 Мбит/с" : "low-speed 1.5 Мбит/с"));
+            serial_puts(spdstr);
             if (role == 1) {
                 serial_puts(" — МЫШЬ");
                 portmap_pm_alive(USBDEV_ROLE_MOUSE);

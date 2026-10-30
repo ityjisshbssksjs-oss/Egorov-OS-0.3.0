@@ -152,4 +152,11 @@ void mouse_hw_ohci_diag(char *out, int outsz);
 void mouse_hw_ohci_snapshot(void);
 void mouse_hw_xhci_snapshot(void);   /* СНИМОК xHCI-мыши (конец экрана) */
 
+/* [#485] ЭТАП 11: для EHCI-драйвера — держит ли OHCI-компаньон (та же
+ * PCI-шина, fn+2 — пары AMD FCH: 0:18.0<->0:18.2, 0:19.0<->0:19.2)
+ * живое устройство на порту №port. EHCI НЕ должен переписывать Port
+ * Owner такому порту: повторная маршрутизация = «release»-шторм
+ * ресетов для живого устройства. Безопасна в любой момент. */
+int ohci_companion_claimed(uint8_t bus, uint8_t dev, uint8_t fn, int port);
+
 #endif

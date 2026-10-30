@@ -40,6 +40,11 @@
 
 bool ehci_init(int fb_w, int fb_h, int force_usb);
 
+/* [#490] ЭТАП 13: разовая повторная маршрутизация LS-гнёзд к компаньонам
+ * ПОСЛЕ mouse_hw_init_ohci() — HCR-сброс OHCI сбрасывает мультиплексор
+ * портов (PO слетает); здесь PO переподнимается (см. ehci.c). */
+void ehci_companion_reroute(void);
+
 /* 0.3.0: полный обход портов EHCI — каждую секунду из usbdev_tick(). */
 void ehci_hotplug_sweep(void);
 

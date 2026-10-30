@@ -20,6 +20,7 @@
 #include "snake.h"
 #include "exe_runner.h"
 #include "terminal.h"
+#include "logwriter.h"
 #include "power.h"
 #include "version.h"   /* [#473] ЭТАП 9: «Сборка N» в окнах О системе */
 
@@ -109,6 +110,7 @@ typedef enum {
     APP_SNAKE,
     APP_EXE_RUNNER,
     APP_TERMINAL,
+    APP_LOGWRITER,
     APP_COUNT
 } app_id_t;
 
@@ -129,6 +131,7 @@ static dwin_t g_apps[APP_COUNT] = {
     [APP_SNAKE]      = { 180,  60, SNAKE_WIN_W,    SNAKE_WIN_H,    "Змейка",               false },
     [APP_EXE_RUNNER] = { 150, 120, EXE_WIN_W,      EXE_WIN_H,      "Запуск программы",     false },
     [APP_TERMINAL]   = { 120,  60, TERMINAL_WIN_W, TERMINAL_WIN_H, "Терминал",             false },
+    [APP_LOGWRITER]  = { 120,  60, LOGWRITER_WIN_W, LOGWRITER_WIN_H, "LOGWRITER — экспорт журнала", false },
 };
 
 static app_id_t g_active = APP_MYPC;
@@ -141,6 +144,24 @@ static const app_id_t exe_to_app[] = {
 
 static void open_app(app_id_t id)  { g_active = id; g_apps[id].open = true; }
 static void close_app(app_id_t id) { g_apps[id].open = false; }
+
+static void close_logwriter_window(void) {
+    close_app(APP_LOGWRITER);
+    if (g_apps[APP_TERMINAL].open) g_active = APP_TERMINAL;
+    else { g_apps[APP_MYPC].open = true; g_active = APP_MYPC; }
+}
+
+/* Called by the terminal command LOGWRITER. Keep the terminal instance
+ * open behind the writer so closing the writer returns to the command line. */
+void desktop_logwriter_open(void) {
+    logwriter_ui_init();
+    g_apps[APP_TERMINAL].open = true;
+    g_apps[APP_LOGWRITER].x = ((int)fb.width  - LOGWRITER_WIN_W) / 2;
+    g_apps[APP_LOGWRITER].y = ((int)fb.height - LOGWRITER_WIN_H - 32) / 2;
+    if (g_apps[APP_LOGWRITER].x < 8) g_apps[APP_LOGWRITER].x = 8;
+    if (g_apps[APP_LOGWRITER].y < 8) g_apps[APP_LOGWRITER].y = 8;
+    open_app(APP_LOGWRITER);
+}
 
 /* ── Меню «Пуск» ─────────────────────────────────────────────────────── */
 
@@ -381,7 +402,7 @@ static void draw_mypc_body(const dwin_t *w) {
     text_draw_str(bx, by + 34, "  Архитектура: i386 (32-bit)", COL_TEXT);
     text_draw_str(bx, by + 50, "  Ядро: монолитное, собственное", COL_TEXT);
     text_draw_str(bx, by + 66, "  Загрузчик: GRUB Multiboot 1 / HDD", COL_TEXT);
-    text_draw_str(bx, by + 82, "  EXE: PE32 i386 (встроенный загрузчик)", COL_TEXT);
+    text_draw_str(bx, by + 82, "  EXE: загрузчик планируется на 0.3.3", COL_TEXT);
 
     const char *mode_s = g_hdd ? "  Режим: установленная система (жёсткий диск)"
                                : "  Режим: Live (с носителя)";
@@ -413,6 +434,7 @@ static void draw_active_app(int mouse_x, int mouse_y) {
         case APP_SNAKE:      snake_draw(w->x, w->y); break;
         case APP_EXE_RUNNER: exe_runner_draw(w->x, w->y); break;
         case APP_TERMINAL:   terminal_draw(w->x, w->y); break;
+        case APP_LOGWRITER:  logwriter_ui_draw(w->x, w->y, w->w, w->h); break;
         default: break;
     }
 
@@ -437,7 +459,8 @@ static void draw_start_menu(void) {
 
     for (int i = 0; i < SM_ITEMS; i++) {
         int iy = sm_item_y(i);
-        bool disabled = (i == 1 && !g_hdd);   /* Проводник только на HDD */
+        /* Explorer scans any already initialized block device, including Live USB. */
+        bool disabled = false;
         if (hov.menu_item == i && !disabled) {
             fb_rect(mx + 4, iy, mw - 8, SM_ITEM_H, COL_TITLE_TOP);
             text_draw_str(mx + 14, iy + 2, sm_labels[i], COL_WHITE);
@@ -579,13 +602,10 @@ static void handle_click(int mx, int my) {
         switch (hov.menu_item) {
             case 0:
                 start_menu_open = false; open_app(APP_MYPC); return;
-            case 1:  /* Проводник живёт только на установленной системе */
+            case 1:  /* 0.3.1: scan actual disks, including Live mode */
                 start_menu_open = false;
-                if (g_hdd) { explorer_init(g_hdd); open_app(APP_EXPLORER); }
-                else open_dialog("Проводник",
-                                 "Проводник доступен только",
-                                 "после установки на жёсткий диск.",
-                                 "Используйте установщик.", 0, 0);
+                explorer_init(g_hdd);
+                open_app(APP_EXPLORER);
                 return;
             case 2:
                 start_menu_open = false; calc_reset(); open_app(APP_CALC); return;
@@ -617,9 +637,9 @@ static void handle_click(int mx, int my) {
                 start_menu_open = false;
                 open_dialog("О системе",
                             "Egorov OS " EGOROV_OS_FULL " (2026)",
-                            "EXE: встроенный PE32/i386 загрузчик",
-                            "Проводник: C:\\Программы\\*.exe",
-                            "Мышь: USB (UHCI/xHCI) или PS/2 (опрос).", 0);
+                            "Встроенные программы пока в ядре.",
+                            "Проводник: реальные файлы FAT32 (только чтение).",
+                            "PE32-загрузчик запланирован на 0.3.3.", 0);
                 return;
             case 11:
                 start_menu_open = false;
@@ -628,17 +648,12 @@ static void handle_click(int mx, int my) {
                 return;
             case 12:
                 start_menu_open = false;
-                if (g_hdd) {
-                    explorer_init(g_hdd);
-                    open_app(APP_EXPLORER);
-                    open_dialog("Запустить EXE",
-                                "Откройте C:\\Программы в Проводнике",
-                                "и дважды щёлкните нужный .exe файл.", 0, 0, 0);
-                } else {
-                    exe_runner_start("demo.exe", EXE_TARGET_UNKNOWN);
-                    g_apps[APP_EXE_RUNNER].title = "Запуск программы";
-                    open_app(APP_EXE_RUNNER);
-                }
+                explorer_init(g_hdd);
+                open_app(APP_EXPLORER);
+                open_dialog("Запуск EXE",
+                            "Реальный запуск файлов EXE ещё не готов.",
+                            "Он запланирован на этап 0.3.3.",
+                            "Сейчас Проводник читает FAT32 только для чтения.", 0, 0);
                 return;
             case SM_REBOOT:
                 start_menu_open = false;
@@ -669,6 +684,7 @@ static void handle_click(int mx, int my) {
     dwin_t *aw = &g_apps[g_active];
     if (aw->open) {
         if (hov.win_close) {
+            if (g_active == APP_LOGWRITER) { close_logwriter_window(); return; }
             close_app(g_active);
             if (g_active == APP_EXE_RUNNER) explorer_launched_exe = -1;
             return;
@@ -681,15 +697,15 @@ static void handle_click(int mx, int my) {
                     open_dialog("Свойства системы",
                                 "Egorov OS " EGOROV_OS_FULL " (2026)",
                                 "Архитектура: i386, 32-битное ядро",
-                                "EXE: встроенный PE32 i386 загрузчик",
+                                "EXE: планируется на этапе 0.3.3",
                                 "Загрузчик: GRUB Multiboot 1 / HDD BL", 0);
                     return;
                 }
                 if (hov.win_help) {
                     open_dialog("Справка",
-                                "Проводник: дважды щёлкните .exe",
-                                "в C:\\Программы для запуска.",
-                                "Пуск → Запустить EXE...", 0, 0);
+                                "Проводник сканирует реальные FAT32-файлы.",
+                                "В этой версии доступен режим только чтения.",
+                                "Запуск EXE появится на этапе 0.3.3.", 0, 0);
                     return;
                 }
                 break;
@@ -741,6 +757,11 @@ static void handle_click(int mx, int my) {
                 snake_click(aw->x, aw->y, mx, my);
                 return;
 
+            case APP_LOGWRITER:
+                if (logwriter_ui_click(aw->x, aw->y, mx, my))
+                    close_logwriter_window();
+                return;
+
             default:
                 break;
         }
@@ -748,16 +769,9 @@ static void handle_click(int mx, int my) {
 
     if (hov.icon_mypc) { open_app(APP_MYPC); return; }
     if (hov.icon_trash) {
-        if (g_hdd) {
-            explorer_init(g_hdd);
-            explorer_open_trash();
-            open_app(APP_EXPLORER);
-        } else {
-            open_dialog("Проводник",
-                        "Проводник доступен только",
-                        "после установки на жёсткий диск.",
-                        "Используйте установщик из меню.", 0, 0);
-        }
+        explorer_init(g_hdd);
+        explorer_open_trash();
+        open_app(APP_EXPLORER);
         return;
     }
 }
@@ -789,7 +803,6 @@ void desktop_run(bool booted_from_hdd) {
     calc_reset();
     notepad_set_hdd(g_hdd);
     notepad_init();
-    explorer_init(g_hdd);
     snake_init();
 
     rtc_time_t t;
@@ -855,7 +868,7 @@ void desktop_run(bool booted_from_hdd) {
              * курсор и событием, и кадром одновременно); зажатие
              * запоминается — дальше движение делает typematic-блок
              * ниже (для USB-клавиатур без собственного повтора). */
-            bool kb_arrow = cursor_kb_mode &&
+            bool kb_arrow = cursor_kb_mode && g_active != APP_LOGWRITER &&
                 (k == KEY_LEFT || k == KEY_RIGHT || k == KEY_UP || k == KEY_DOWN);
             if (kb_arrow) {
                 bool fresh = true;
@@ -887,6 +900,7 @@ void desktop_run(bool booted_from_hdd) {
             } else if (k == KEY_ESC) {
                 if (dlg_title)                  close_dialog();
                 else if (start_menu_open)       start_menu_open = false;
+                else if (g_active == APP_LOGWRITER) close_logwriter_window();
                 else if (g_apps[g_active].open) close_app(g_active);
                 need_redraw = true;
             } else if (k == KEY_ENTER) {
@@ -898,6 +912,9 @@ void desktop_run(bool booted_from_hdd) {
                     enter_used = true;
                 } else if (g_apps[g_active].open && g_active == APP_NOTEPAD) {
                     notepad_key(k);        /* Enter = новая строка */
+                    enter_used = true;
+                } else if (g_apps[g_active].open && g_active == APP_LOGWRITER) {
+                    if (logwriter_ui_key(k)) close_logwriter_window();
                     enter_used = true;
                 }
                 need_redraw = true;
@@ -915,6 +932,9 @@ void desktop_run(bool booted_from_hdd) {
                 else if (open && g_active == APP_NOTEPAD)  notepad_key(k);
                 else if (open && g_active == APP_SNAKE)    snake_key(k);
                 else if (open && g_active == APP_TERMINAL) terminal_key(k);
+                else if (open && g_active == APP_LOGWRITER) {
+                    if (logwriter_ui_key(k)) close_logwriter_window();
+                }
                 need_redraw = true;
             }
         }

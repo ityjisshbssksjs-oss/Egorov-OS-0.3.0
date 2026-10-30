@@ -6,7 +6,7 @@
  * Слои (см. kernel/logstick.h — полный контракт):
  *   • единый блочный интерфейс поверх трёх транспортов BOT/SCSI;
  *   • MBR/GPT + границы разделов против READ CAPACITY;
- *   • единственная цель записи — FAT32-раздел с меткой тома «LOGS»;
+ *   • обычная запись: безопасный не-загрузочный FAT32-раздел любой метки;
  *   • ограниченная FAT32: создать/дополнить EGOROV.LOG (8.3, корень),
  *     цепочка кластеров, ОБЕ копии FAT, FSInfo, размер в каталоге;
  *   • буферизация: klog → дельта-выгрузка (1 Гц) + финальная;
@@ -17,11 +17,12 @@
  *   1. ls_wr() пишет ТОЛЬКО в [part_start, part_end) — LBA собранных
  *      структур FAT; запись в MBR (LBA 0), VBR раздела, чужие разделы,
  *      за пределы диска — НЕВОЗМОЖНА (центральный страж).
- *   2. Раздел обязан быть FAT32 с меткой тома «LOGS» (том подготовлен
- *      ПОЛЬЗОВАТЕЛЕМ: mkstick.py для синтетики, форматирование в
- *      Windows для реальной флешки). Автоформатирования НЕТ, создание
- *      разделов НЕТ, «докручивание» чужой геометрии НЕТ.
- *   3. Активный (0x80) MBR-раздел и ESP-раздел GPT исключены.
+ *   2. Обычная запись допускает FAT32-раздел любой метки, но только после
+ *      проверки BPB и геометрии; активные разделы/ESP и пересечения отвергаются.
+ *      Если FAT32 не распознан, отдельно доступен RAW-режим после двойного
+ *      подтверждения: он перезаписывает LBA 0 и начальные сектора, разрушая
+ *      таблицу разделов/доступ к существующим данным. Автоформатирования нет.
+ *   3. Активный (0x80) MBR-раздел и ESP-раздел GPT исключены из FAT-записи.
  *   4. EGOROV.LOG: запись либо создаётся в СВОБОДНОМ слоте каталога,
  *      либо ДОПОЛНЯЕТСЯ (с проверкой целостности цепочки кластеров:
  *      длина цепочки обязана совпадать с размером файла, иначе — отказ,
@@ -32,6 +33,7 @@
  */
 
 #include "logstick.h"
+#include "logwriter.h"
 #include "types.h"
 #include "usb.h"        /* UHCI: usb_drive / usb_{read,write}_sector */
 #include "mouse_hw.h"   /* OHCI: mouse_hw_msd_*; xHCI: mouse_hw_xhci_msd_* */
@@ -88,6 +90,20 @@ static uint32_t g_ls_io_sect;           /* всего секторов запи�
 
 /* границы разрешённой области записи (центральный страж; 0=запрет всего) */
 static uint32_t g_part_start, g_part_end;
+static bool g_part_guard_enabled;
+
+/* LOGWRITER is an on-demand, frozen snapshot export. 192 KiB covers the
+ * default 128 KiB early buffer plus the maximum 64 KiB live ring, provided
+ * no gap has already been lost. The snapshot is immutable while USB I/O runs. */
+#define LOGWRITER_SNAPSHOT_MAX (192u * 1024u)
+static uint8_t g_logwriter_snapshot[LOGWRITER_SNAPSHOT_MAX] __attribute__((aligned(4096)));
+
+static void lw_copy_text(char *dst, uint32_t cap, const char *src) {
+    if (!dst || cap == 0) return;
+    uint32_t i = 0;
+    if (src) while (src[i] && i + 1u < cap) { dst[i] = src[i]; i++; }
+    dst[i] = 0;
+}
 
 static const char *ls_tr_name(int tr) {
     switch (tr) {
@@ -150,6 +166,19 @@ static int ls_blk_enumerate(ls_cand_t *out, int max) {
     return n;
 }
 
+int logwriter_list_devices(logwriter_device_t *out, int max_devices) {
+    if (!out || max_devices <= 0) return 0;
+    if (max_devices > LOGWRITER_MAX_DEVICES) max_devices = LOGWRITER_MAX_DEVICES;
+    ls_cand_t cand[LOGWRITER_MAX_DEVICES];
+    int n = ls_blk_enumerate(cand, max_devices);
+    for (int i = 0; i < n; i++) {
+        out[i].transport = cand[i].tr;
+        out[i].sectors = cand[i].cap;
+        lw_copy_text(out[i].name, sizeof(out[i].name), cand[i].name);
+    }
+    return n;
+}
+
 /* чтение сектора в g_sec (512).  Транспорт-агностично. */
 static bool ls_rd(uint32_t lba) {
     if (g_ls_tr == LS_TR_NONE) return false;
@@ -164,12 +193,12 @@ static bool ls_rd(uint32_t lba) {
     return ok;
 }
 
-/* ЦЕНТРАЛЬНЫЙ СТРАЖ ЗАПИСИ: сектор g_sec → lba.  Разрешено ТОЛЬКО
- * внутри [g_part_start, g_part_end) — области раздела LOGS.  Всё
- * остальное (MBR, VBR, чужие разделы, за диск) отвергается ДО того,
- * как хоть один байт уйдёт на носитель. */
+/* ЦЕНТРАЛЬНЫЙ СТРАЖ ЗАПИСИ: сектор g_sec → lba. Обычный FAT32 экспорт
+ * разрешён только в [g_part_start, g_part_end). Для whole-disk FAT32
+ * (superfloppy) start может быть LBA 0; его end берётся из валидированного
+ * BPB. RAW использует отдельную функцию с отдельным явным подтверждением. */
 static bool ls_wr(uint32_t lba) {
-    if (g_part_start == 0 || g_part_end == 0) return false;  /* не готово */
+    if (!g_part_guard_enabled || g_part_end == 0) return false;  /* не готово */
     if (lba < g_part_start || lba >= g_part_end) {
         serial_puts("LOGS: ОТКАЗ: сектор ");
         ls_pn("", lba, "");
@@ -190,7 +219,7 @@ static bool ls_wr(uint32_t lba) {
     return ok;
 }
 
-/* ═══ 2. MBR / GPT: найти раздел LOGS ══════════════════════════════════════ */
+/* ═══ 2. MBR / GPT: найти разделы ═════════════════════════════════════════ */
 
 typedef struct {
     uint32_t start;   /* первый LBA раздела                          */
@@ -200,11 +229,49 @@ typedef struct {
     int      gpt;     /* 1 = запись из GPT                           */
 } ls_part_t;
 
-#define LS_MAX_PARTS 20
+#define LS_MAX_PARTS 128
 static ls_part_t g_parts[LS_MAX_PARTS];
 static int        g_nparts;
 static int        g_is_gpt;
+static bool       g_disk_superfloppy; /* FAT32 whole-disk volume without MBR partition table */
+static bool       g_disk_map_untrusted; /* malformed/inconsistent partition map: refuse writes */
 static uint32_t   g_disk_sects;   /* ёмкость носителя (READ CAPACITY)  */
+
+static uint32_t ls_rdb32(const uint8_t *p);
+static uint32_t lw_crc32(const uint8_t *data, uint32_t len);
+
+static uint32_t ls_crc32_update(uint32_t crc, const uint8_t *data, uint32_t len) {
+    for (uint32_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int bit = 0; bit < 8; bit++)
+            crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+    }
+    return crc;
+}
+
+static bool ls_sector_looks_fat32(const uint8_t *b) {
+    /* BPB is authoritative; the optional human-readable "FAT32" type
+     * string at offset 0x52 is informational and must not gate recognition. */
+    uint16_t bps = (uint16_t)(b[11] | ((uint16_t)b[12] << 8));
+    uint8_t spc = b[13];
+    uint16_t rsvd = (uint16_t)(b[14] | ((uint16_t)b[15] << 8));
+    uint8_t nfats = b[16];
+    uint16_t root_entries = (uint16_t)(b[17] | ((uint16_t)b[18] << 8));
+    uint16_t total16 = (uint16_t)(b[19] | ((uint16_t)b[20] << 8));
+    uint16_t fatsz16 = (uint16_t)(b[22] | ((uint16_t)b[23] << 8));
+    uint32_t total = ls_rdb32(b + 32);
+    uint32_t fatsz = ls_rdb32(b + 0x24);
+    uint32_t root = ls_rdb32(b + 0x2C);
+    if (b[510] != 0x55 || b[511] != 0xAA || bps != 512 ||
+        spc == 0 || (spc & (spc - 1u)) != 0 || spc > 128 ||
+        rsvd == 0 || (nfats != 1 && nfats != 2) || root_entries != 0 ||
+        total16 != 0 || fatsz16 != 0 || total == 0 ||
+        total > g_disk_sects || fatsz == 0 || root < 2 || rsvd >= total)
+        return false;
+    /* Check without overflowing the 32-bit freestanding arithmetic. */
+    if (fatsz > (total - rsvd) / nfats) return false;
+    return rsvd + nfats * fatsz < total;
+}
 
 static void ls_part_add(uint32_t start, uint32_t sects, uint8_t type,
                         uint8_t active, int gpt) {
@@ -233,6 +300,8 @@ static uint64_t ls_rdb64(const uint8_t *p) {
 static bool ls_parse_disk(void) {
     g_nparts = 0;
     g_is_gpt = 0;
+    g_disk_superfloppy = false;
+    g_disk_map_untrusted = false;
     g_disk_sects = g_ls_cap_sect;
 
     if (!ls_rd(0)) {
@@ -240,12 +309,21 @@ static bool ls_parse_disk(void) {
         return false;
     }
     if (g_sec[510] != 0x55 || g_sec[511] != 0xAA) {
-        serial_puts("LOGS: нет MBR-подписи 55AA - носитель без таблицы\n");
-        serial_puts("LOGS: разделов нет, записывать некуда (безопасный отказ)\n");
+        serial_puts("LOGS: нет MBR-подписи 55AA - таблица разделов не распознана\n");
         return false;
+    }
+    /* Some USB sticks expose a FAT32 superfloppy without an MBR partition
+     * table. Detect the BPB before treating its boot code as MBR entries. */
+    if (ls_sector_looks_fat32(g_sec)) {
+        g_disk_superfloppy = true;
+        serial_puts("LOGWRITER: распознан FAT32 superfloppy (без таблицы разделов)\n");
+        return true;
     }
 
     if (g_sec[446 + 4] == 0xEE) {
+        /* A protective MBR means a GPT map is expected. Keep the map marked
+         * untrusted until the header and complete entry-array reads succeed. */
+        g_disk_map_untrusted = true;
         /* ── защитный MBR → GPT ── */
         g_is_gpt = 1;
         serial_puts("LOGS: найден защитный MBR (0xEE) - разбираю GPT\n");
@@ -255,6 +333,31 @@ static bool ls_parse_disk(void) {
         }
         if (memcmp(g_sec, "EFI PART", 8) != 0) {
             serial_puts("LOGS: сигнатура GPT не найдена - отказ\n");
+            return false;
+        }
+        uint32_t header_size = ls_rdb32(g_sec + 12);
+        uint32_t header_crc_expected = ls_rdb32(g_sec + 16);
+        uint32_t entries_crc_expected = ls_rdb32(g_sec + 88);
+        uint64_t current_lba = ls_rdb64(g_sec + 24);
+        uint64_t backup_lba = ls_rdb64(g_sec + 32);
+        uint64_t first_usable = ls_rdb64(g_sec + 40);
+        uint64_t last_usable = ls_rdb64(g_sec + 48);
+        if (header_size < 92u || header_size > 512u || current_lba != 1u ||
+            backup_lba >= (uint64_t)g_disk_sects || backup_lba == current_lba ||
+            first_usable < 2u || first_usable > last_usable ||
+            last_usable >= (uint64_t)g_disk_sects || last_usable >= backup_lba) {
+            serial_puts("LOGS: недопустимая геометрия GPT header - отказ\n");
+            return false;
+        }
+        /* Header CRC is computed with its own CRC field set to zero. */
+        g_sec[16] = g_sec[17] = g_sec[18] = g_sec[19] = 0u;
+        uint32_t header_crc_actual = lw_crc32(g_sec, header_size);
+        g_sec[16] = (uint8_t)header_crc_expected;
+        g_sec[17] = (uint8_t)(header_crc_expected >> 8);
+        g_sec[18] = (uint8_t)(header_crc_expected >> 16);
+        g_sec[19] = (uint8_t)(header_crc_expected >> 24);
+        if (header_crc_actual != header_crc_expected) {
+            serial_puts("LOGS: CRC заголовка GPT не совпала - карта недостоверна\n");
             return false;
         }
         uint64_t entry_lba = ls_rdb64(g_sec + 72);
@@ -268,32 +371,56 @@ static bool ls_parse_disk(void) {
             serial_puts("LOGS: записи GPT за 2ТБ - не поддержано\n");
             return false;
         }
-        /* первые 16 записей (4 сектора) — на практике хватает всегда;
-         * остальное честно не разбираем */
+        /* Читаем все записи GPT в пределах заявленного лимита 128.
+         * Прежде чем читать массив, проверяем его целиком на границы диска. */
         int take = (int)nent;
-        if (take > 16) take = 16;
+        uint64_t entry_sectors = ((uint64_t)nent * (uint64_t)esz + 511u) / 512u;
+        if (entry_lba < 2u || entry_lba + entry_sectors > (uint64_t)g_disk_sects ||
+            entry_lba + entry_sectors > first_usable) {
+            serial_puts("LOGS: массив GPT выходит за границы диска/usable range - отказ\n");
+            return false;
+        }
+        uint32_t entry_crc_state = 0xFFFFFFFFu;
+        bool gpt_entries_untrusted = false;
         for (int e = 0; e < take; e++) {
             uint32_t lba = (uint32_t)entry_lba + (uint32_t)(e / 4);
             if (e % 4 == 0) {
                 if (!ls_rd(lba)) {
-                    serial_puts("LOGS: записи GPT не читаются\n");
-                    break;
+                    serial_puts("LOGS: записи GPT не читаются; карта разделов недостоверна\n");
+                    return false;
                 }
+                uint32_t count = nent - (uint32_t)e;
+                if (count > 4u) count = 4u;
+                entry_crc_state = ls_crc32_update(entry_crc_state, g_sec, count * 128u);
             }
             const uint8_t *ent = g_sec + (e % 4) * 128;
-            if (ent[0] == 0 && ent[1] == 0 && ent[2] == 0 && ent[3] == 0)
-                continue;                         /* пустая запись        */
+            bool empty_type = true;
+            for (int k = 0; k < 16; k++) if (ent[k] != 0u) empty_type = false;
+            if (empty_type) continue;
             uint64_t f = ls_rdb64(ent + 32);
             uint64_t l = ls_rdb64(ent + 40);
-            if (l <= f || f > 0xFFFFFFFFull) continue;
+            if (l < f || f > 0xFFFFFFFFull || f == 0u) {
+                gpt_entries_untrusted = true;
+                continue;
+            }
             uint64_t sects = l - f + 1u;
-            if (sects > 0xFFFFFFFFull) sects = 0xFFFFFFFFull;
-            /* ESP (EFI System Partition) — загрузочный: GUID
-             * C12A7328-... первые 4 байта LE = 28 73 2A C1 */
-            uint8_t esp = (ent[0] == 0x28 && ent[1] == 0x73 &&
-                           ent[2] == 0x2A && ent[3] == 0xC1) ? 1u : 0u;
+            if (sects > 0xFFFFFFFFull) {
+                gpt_entries_untrusted = true;
+                continue;
+            }
+            /* EFI System Partition GUID in on-disk byte order. */
+            static const uint8_t ls_efi_guid[16] = {
+                0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11,
+                0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B
+            };
+            uint8_t esp = (memcmp(ent, ls_efi_guid, 16) == 0) ? 1u : 0u;
             ls_part_add((uint32_t)f, (uint32_t)sects, 0, esp, 1);
         }
+        if (~entry_crc_state != entries_crc_expected) {
+            serial_puts("LOGS: CRC массива записей GPT не совпала - RAW запрещён\n");
+            return false;
+        }
+        g_disk_map_untrusted = gpt_entries_untrusted;
     } else {
         /* ── классический MBR: 4 первичных записи ── */
         for (int i = 0; i < 4; i++) {
@@ -304,10 +431,16 @@ static bool ls_parse_disk(void) {
             uint32_t sz  = ls_rdb32(e + 12);
             if (typ == 0) continue;
             if (typ == 0x05 || typ == 0x0F || typ == 0x85) {
+                g_disk_map_untrusted = true; /* EBR chain not parsed: RAW must be refused */
                 serial_puts("LOGS: расширенный раздел (");
                 serial_puthex(typ);
                 serial_puts(") не поддержан - пропущен (внутри может быть\n");
                 serial_puts("LOGS: что угодно - не разбираем, не трогаем)\n");
+                continue;
+            }
+            if (st == 0u || sz == 0u) {
+                g_disk_map_untrusted = true;
+                serial_puts("LOGS: некорректные границы MBR-раздела; запись будет запрещена\n");
                 continue;
             }
             ls_part_add(st, sz, typ, act, 0);
@@ -328,14 +461,26 @@ static bool ls_parse_disk(void) {
             serial_puts(" - ВЫХОДИТ ЗА ГРАНИЦЫ НОСИТЕЛЯ (");
             ls_pn("", g_disk_sects, " секторов) - ОТКЛОНЁН\n");
             p->sects = 0;
+            g_disk_map_untrusted = true;
         } else {
             serial_puts("\n");
+        }
+    }
+    for (int i = 0; i < g_nparts; i++) {
+        if (g_parts[i].sects == 0u) continue;
+        uint64_t i_end = (uint64_t)g_parts[i].start + g_parts[i].sects;
+        for (int j = i + 1; j < g_nparts; j++) {
+            if (g_parts[j].sects == 0u) continue;
+            uint64_t j_end = (uint64_t)g_parts[j].start + g_parts[j].sects;
+            if ((uint64_t)g_parts[i].start < j_end &&
+                (uint64_t)g_parts[j].start < i_end)
+                g_disk_map_untrusted = true;
         }
     }
     return true;
 }
 
-/* ═══ 3. FAT32 раздела LOGS ═══════════════════════════════════════════════ */
+/* ═══ 3. FAT32-раздела любой метки ════════════════════════════════════════ */
 
 typedef struct {
     uint32_t vbr;          /* LBA загрузочного сектора раздела            */
@@ -363,7 +508,7 @@ typedef struct {
 
 static ls_fat_t g_fat;
 
-/* 8.3 имя EGOROV.LOG: «EGOROV  » + «LOG»; метка тома «LOGS» */
+/* 8.3 имя EGOROV.LOG: «EGOROV  » + «LOG». */
 static const uint8_t LS_FILE_NAME[11] =
     { 'E','G','O','R','O','V',' ',' ','L','O','G' };
 static const uint8_t LS_LABEL[11] =
@@ -490,43 +635,61 @@ static bool ls_fat_parse(const ls_part_t *p) {
 
     if (!ls_rd(p->start)) return false;
     if (g_sec[510] != 0x55 || g_sec[511] != 0xAA) return false;
-    if (memcmp(g_sec + 0x52, "FAT32", 5) != 0) return false;
 
     uint16_t bps   = (uint16_t)(g_sec[11] | ((uint16_t)g_sec[12] << 8));
     uint8_t  spc   = g_sec[13];
     uint16_t rsvd  = (uint16_t)(g_sec[14] | ((uint16_t)g_sec[15] << 8));
     uint8_t  nfats = g_sec[16];
+    uint16_t root_entries = (uint16_t)(g_sec[17] | ((uint16_t)g_sec[18] << 8));
+    uint16_t total16 = (uint16_t)(g_sec[19] | ((uint16_t)g_sec[20] << 8));
+    uint16_t fatsz16 = (uint16_t)(g_sec[22] | ((uint16_t)g_sec[23] << 8));
+    uint32_t total_secs = ls_rdb32(g_sec + 32);
     uint32_t fatsz = ls_rdb32(g_sec + 0x24);
     uint32_t rootc = ls_rdb32(g_sec + 0x2C);
     uint16_t fsinf = (uint16_t)(g_sec[0x30] | ((uint16_t)g_sec[0x31] << 8));
 
-    if (bps != 512) {                       /* транспорт умеет только 512 */
-        serial_puts("LOGS: FAT: байт/сектор != 512 - не поддержано\n");
+    /* Do not trust the optional "FAT32" text field: identify the volume
+     * by BPB geometry instead. FAT32 has no fixed root-entry table and uses
+     * TotSec32/FATSz32 (the 16-bit fields are zero). */
+    if (bps != 512 || total_secs == 0u || total_secs > p->sects) return false;
+    if (root_entries != 0u || total16 != 0u || fatsz16 != 0u) return false;
+    if (spc == 0 || (spc & (spc - 1u)) != 0 || spc > 128) return false;
+    if (rsvd == 0 || rsvd >= total_secs || (nfats != 1u && nfats != 2u) || fatsz == 0u || rootc < 2u)
         return false;
-    }
-    if (spc == 0 || (spc & (spc - 1u)) != 0 || spc > 128) {
-        serial_puts("LOGS: FAT: секторов/кластер не степень 2 - мусор\n");
+    if (fatsz > (total_secs - rsvd) / nfats) return false;
+
+    uint64_t fat_lba64 = (uint64_t)p->start + (uint64_t)rsvd;
+    uint64_t data_lba64 = fat_lba64 + (uint64_t)nfats * (uint64_t)fatsz;
+    uint64_t volume_end64 = (uint64_t)p->start + (uint64_t)total_secs;
+    if (data_lba64 >= volume_end64 || volume_end64 > (uint64_t)p->start + p->sects ||
+        volume_end64 > (uint64_t)g_disk_sects || data_lba64 > 0xFFFFFFFFull ||
+        volume_end64 > 0xFFFFFFFFull || fat_lba64 > 0xFFFFFFFFull)
         return false;
-    }
-    if (rsvd == 0 || nfats == 0 || fatsz == 0 || rootc < 2) return false;
+
+    uint32_t data_secs32 = (uint32_t)(volume_end64 - data_lba64);
+    /* volume_end64/data_lba64 were bounded to 32-bit LBA above; divide in
+     * 32-bit arithmetic to avoid a libgcc helper in the freestanding kernel. */
+    uint64_t clus_count64 = (uint64_t)(data_secs32 / (uint32_t)spc) + 2u;
+    uint64_t fat_entries64 = (uint64_t)fatsz * 512u / 4u;
+    /* FAT32 entries are 28-bit; the FAT must cover every data cluster. */
+    if (clus_count64 < 3u || clus_count64 > 0x0FFFFFF7ull ||
+        rootc >= clus_count64 || fat_entries64 < clus_count64)
+        return false;
 
     memcpy(g_fat.label, g_sec + 0x47, 11);
     g_fat.label[11] = 0;
-
     g_fat.vbr       = p->start;
     g_fat.start     = p->start;
-    g_fat.end       = p->start + p->sects;
+    g_fat.end       = (uint32_t)volume_end64;
     g_fat.spc       = spc;
     g_fat.rsvd      = rsvd;
     g_fat.nfats     = nfats;
     g_fat.fatsz     = fatsz;
     g_fat.root_clus = rootc;
-    g_fat.fat_lba   = p->start + rsvd;
-    uint32_t data   = g_fat.fat_lba + (uint32_t)nfats * fatsz;
-    if (data >= g_fat.end) return false;    /* FAT больше раздела - мусор */
-    g_fat.data_lba   = data;
-    g_fat.clus_count = (g_fat.end - data) / spc + 2u;
-    g_fat.fsinfo_lba = (fsinf > 1 && fsinf < p->sects)
+    g_fat.fat_lba   = (uint32_t)fat_lba64;
+    g_fat.data_lba  = (uint32_t)data_lba64;
+    g_fat.clus_count = (uint32_t)clus_count64;
+    g_fat.fsinfo_lba = (fsinf > 1u && fsinf < rsvd)
                        ? (p->start + fsinf) : 0u;
     return true;
 }
@@ -785,6 +948,97 @@ static uint32_t ls_append(const uint8_t *data, uint32_t len) {
     return done;
 }
 
+/* Strict FAT lookup used by LOGWRITER validation. Unlike ls_fat_get(), it
+ * keeps I/O errors distinct from the end-of-chain marker. */
+static bool ls_fat_get_checked(uint32_t clus, uint32_t *value) {
+    if (!value || clus < 2u || clus >= g_fat.clus_count) return false;
+    uint32_t off = clus * 4u;
+    uint32_t sec_off = off >> 9;
+    if (sec_off >= g_fat.fatsz) return false;
+    uint32_t lba = g_fat.fat_lba + sec_off;
+    if (lba < g_fat.fat_lba || lba >= g_fat.fat_lba + g_fat.fatsz) return false;
+    if (lba != g_fat.fat_cache_lba) {
+        if (!ls_rd(lba)) return false;
+        memcpy(g_fat.fat_cache, g_sec, 512);
+        g_fat.fat_cache_lba = lba;
+    }
+    *value = ls_rdb32(g_fat.fat_cache + (off & 511u)) & 0x0FFFFFFFu;
+    return true;
+}
+
+/* Validate the complete existing file chain before reusing EGOROV.LOG.
+ * The caller receives its cluster count; I/O errors are always failures. */
+static bool ls_validate_chain_strict(uint32_t first, uint32_t size, uint32_t *count_out) {
+    if (!count_out) return false;
+    *count_out = 0;
+    if (first == 0u) return size == 0u;
+    if (first < 2u || first >= g_fat.clus_count) return false;
+    uint32_t cluster_bytes = (uint32_t)g_fat.spc * 512u;
+    if (cluster_bytes == 0u) return false;
+    uint32_t need = size ? (size / cluster_bytes) + ((size % cluster_bytes) ? 1u : 0u) : 0u;
+    if (need > g_fat.clus_count) return false;
+    /* An allocated chain with zero file size is unusual and may be corrupt;
+     * refuse to reclaim it automatically rather than risk freeing unrelated data. */
+    if (size == 0u) return false;
+    uint32_t current = first;
+    uint32_t limit = need;
+    for (uint32_t i = 0; i < limit; i++) {
+        if (current < 2u || current >= g_fat.clus_count) return false;
+        uint32_t next;
+        if (!ls_fat_get_checked(current, &next)) return false;
+        if (need) {
+            if (i + 1u < need) {
+                if (next < 2u || next >= g_fat.clus_count || next >= LS_FAT_EOC) return false;
+                current = next;
+            } else {
+                if (next < LS_FAT_EOC) return false;
+                *count_out = need;
+                return true;
+            }
+        } else {
+            if (next >= LS_FAT_EOC) { *count_out = i + 1u; return true; }
+            if (next < 2u || next >= g_fat.clus_count) return false;
+            current = next;
+        }
+    }
+    return false; /* cycle or unbounded chain */
+}
+
+/* Clear an existing log only after its directory entry and full FAT chain
+ * have been validated. First publish an empty file, then release its old
+ * clusters; a power failure can leak clusters but cannot leave the file
+ * pointing at freed data. */
+static bool ls_truncate_existing_log(void) {
+    uint32_t old_first = g_fat.first_clus, old_size = g_fat.fsize, old_count = 0;
+    if (!ls_validate_chain_strict(old_first, old_size, &old_count)) {
+        serial_puts("LOGWRITER: существующая FAT-цепочка EGOROV.LOG сомнительна; отказ.\n");
+        return false;
+    }
+    g_fat.first_clus = 0; g_fat.last_clus = 0; g_fat.fsize = 0;
+    if (!ls_dir_update()) {
+        g_fat.first_clus = old_first; g_fat.fsize = old_size;
+        serial_puts("LOGWRITER: не удалось безопасно обнулить запись каталога.\n");
+        return false;
+    }
+    g_dir_confirmed = 0;
+    uint32_t current = old_first;
+    for (uint32_t i = 0; i < old_count; i++) {
+        uint32_t next = 0;
+        if (i + 1u < old_count && !ls_fat_get_checked(current, &next)) {
+            serial_puts("LOGWRITER: файл обнулён, чтение старой FAT-цепочки прервано; проверьте том.\n");
+            return false;
+        }
+        if (!ls_fat_set(current, 0u)) {
+            serial_puts("LOGWRITER: файл обнулён, но освобождение старых кластеров не завершено.\n");
+            return false;
+        }
+        current = next;
+    }
+    g_fat.fat_cache_lba = 0xFFFFFFFFu;
+    return true;
+}
+
+
 /* ═══ 5. Диспетчер выгрузки (буферизация + периодичность) ═════════════════
  *
  * [build 4] ИСТОЧНИК ЖУРНАЛА — ДВУХФАЗНЫЙ (проблема 3 ревью build 3:
@@ -965,49 +1219,101 @@ static uint32_t ls_flush(uint32_t sector_budget) {
 
 /* ═══ 6. Публичный API ════════════════════════════════════════════════════ */
 
-/* Поиск раздела LOGS на ТЕКУЩЕМ накопителе (g_ls_tr/g_ls_cap_sect уже
- * установлены).  true = найден: g_fat готов, СТРАЖ ЗАПИСИ ВКЛЮЧЁН
- * (g_part_start/g_part_end), напечатаны границы.  false = на этом
- * носителе раздела LOGS нет (или геометрия не читается) — вызывающий
- * переходит к СЛЕДУЮЩЕМУ накопителю. */
-static bool ls_find_logs_part(void) {
+/* Поиск безопасного FAT32-раздела на текущем устройстве. require_logs_label
+ * is true only for automatic sticklog; interactive LOGWRITER permits any label.
+ * Возвращает 1 = найден, 0 = таблица читается, FAT32 не найден, -1 =
+ * транспортная/частичная ошибка чтения (RAW fallback при этом запрещён). */
+static bool ls_ranges_overlap(const ls_part_t *a, const ls_part_t *b) {
+    if (!a || !b || a->sects == 0u || b->sects == 0u) return false;
+    uint64_t a0 = a->start, a1 = (uint64_t)a->start + a->sects;
+    uint64_t b0 = b->start, b1 = (uint64_t)b->start + b->sects;
+    return a0 < b1 && b0 < a1;
+}
+
+static int ls_find_fat32_part(bool require_logs_label) {
+    uint32_t rd_before = g_ls_rd_errs;
+    bool saw_fat32_but_protected = false;
+    g_part_start = g_part_end = 0u;
+    g_part_guard_enabled = false;
     if (!ls_parse_disk()) {
-        serial_puts("LOGS: геометрия этого носителя не читается - проверяю\n");
-        serial_puts("LOGS: следующий накопитель\n");
-        return false;
+        if (g_ls_rd_errs != rd_before) return -1;
+        return g_disk_map_untrusted ? -2 : 0;
     }
+    /* A partially readable or geometrically inconsistent partition map is
+     * never eligible for ordinary writes or destructive RAW fallback. */
+    if (g_ls_rd_errs != rd_before) return -1;
+    if (g_disk_map_untrusted) {
+        serial_puts("LOGWRITER: карта разделов повреждена/пересекается; запись и RAW запрещены\n");
+        return -2;
+    }
+    if (g_disk_superfloppy) {
+        ls_part_t whole;
+        memset(&whole, 0, sizeof(whole));
+        whole.start = 0u;
+        whole.sects = g_disk_sects;
+        whole.type = 0x0Cu;
+        if (!ls_fat_parse(&whole)) {
+            /* The sector resembles a FAT32 VBR, but its complete geometry
+             * failed validation. Do not offer destructive RAW over it. */
+            g_disk_map_untrusted = true;
+            return (g_ls_rd_errs != rd_before) ? -1 : -2;
+        }
+        if (require_logs_label && !ls_eq11((const uint8_t *)g_fat.label, LS_LABEL)) {
+            serial_puts("LOGS: автоматический режим пропускает FAT32 без метки LOGS\n");
+            return 0;
+        }
+        g_part_start = g_fat.start; /* may legitimately be LBA 0 */
+        g_part_end = g_fat.end;
+        g_part_guard_enabled = true;
+        serial_puts("LOGWRITER: безопасный FAT32 superfloppy найден (метка: '");
+        serial_puts(g_fat.label);
+        serial_puts("'); запись ограничена BPB-объёмом.\n");
+        return 1;
+    }
+
     for (int i = 0; i < g_nparts; i++) {
         ls_part_t *p = &g_parts[i];
-        if (p->sects == 0) continue;          /* вычеркнут (за границей)  */
-        if (p->active) {
-            serial_puts("LOGS: раздел ");
-            ls_pn("", (uint32_t)(i + 1), " ЗАГРУЗОЧНЫЙ (0x80/ESP) - исключён\n");
+        if (p->sects == 0u) continue;
+        /* Extended MBR containers are not volumes; their nested logical
+         * partitions are not parsed by this kernel yet. */
+        if (!p->gpt && (p->type == 0x05u || p->type == 0x0Fu || p->type == 0x85u))
             continue;
-        }
-        /* GPT: тип не кодирует FAT — проверяем VBR; MBR: 0x0B/0x0C */
-        if (!p->gpt && p->type != 0x0B && p->type != 0x0C) continue;
-        if (!ls_fat_parse(p)) continue;       /* не FAT32 — мимо */
-
-        serial_puts("LOGS: FAT32-раздел: LBA ");
-        ls_pn("", p->start, " + ");
-        ls_pn("", p->sects, " секторов, метка тома '");
-        serial_puts(g_fat.label);
-        serial_puts("'\n");
-        if (!ls_eq11((const uint8_t *)g_fat.label, LS_LABEL)) {
-            serial_puts("LOGS: метка не 'LOGS' - раздел НЕ предназначен для\n");
-            serial_puts("LOGS: журналов; ищу дальше (чужое не трогаю)\n");
+        if (!ls_fat_parse(p)) continue;
+        if (g_ls_rd_errs != rd_before) return -1;
+        if (require_logs_label && !ls_eq11((const uint8_t *)g_fat.label, LS_LABEL)) {
+            serial_puts("LOGS: автоматический режим пропускает FAT32 без метки LOGS\n");
             continue;
         }
 
-        /* ЭТО раздел LOGS: включаем стража записи */
+        /* A recognizable FAT32 volume is not a reason for RAW fallback if
+         * it is a boot/EFI or overlapping partition: refuse rather than risk
+         * destroying an existing readable filesystem. */
+        bool overlaps = false;
+        for (int j = 0; j < g_nparts; j++) {
+            if (j != i && ls_ranges_overlap(p, &g_parts[j])) {
+                overlaps = true;
+                break;
+            }
+        }
+        bool mbr_efi = (!p->gpt && p->type == 0xEFu);
+        if (p->active || mbr_efi || overlaps) {
+            saw_fat32_but_protected = true;
+            serial_puts("LOGWRITER: FAT32 распознан, но раздел защищён (active/ESP или пересечение); пропускаю\n");
+            continue;
+        }
+
         g_part_start = g_fat.start;
         g_part_end   = g_fat.end;
-        serial_puts("LOGS: раздел LOGS НАЙДЕН: LBA ");
+        g_part_guard_enabled = true;
+        serial_puts("LOGWRITER: безопасный FAT32-раздел найден (любая метка: '");
+        serial_puts(g_fat.label);
+        serial_puts("'), LBA ");
         ls_pn("", g_part_start, " + ");
-        ls_pn("", g_part_end - g_part_start, " (запись разрешена ТОЛЬКО сюда)\n");
-        return true;
+        ls_pn("", g_part_end - g_part_start, " секторов. Запись ограничена этим разделом.\n");
+        return 1;
     }
-    return false;
+    if (saw_fat32_but_protected) return -2;
+    return (g_ls_rd_errs != rd_before) ? -1 : 0;
 }
 
 void ls_stick_prepare(uint32_t cap_bytes) {
@@ -1017,6 +1323,7 @@ void ls_stick_prepare(uint32_t cap_bytes) {
     g_ls_bytes_in_file = 0;
     g_ls_cap = (cap_bytes && cap_bytes < 0x80000000u) ? cap_bytes : LS_DEFAULT_CAP;
     g_part_start = g_part_end = 0;
+    g_part_guard_enabled = false;
     g_src_phase = 0;
     g_src_early = 0;
     g_ring_pos = 0;
@@ -1042,11 +1349,10 @@ void ls_stick_prepare(uint32_t cap_bytes) {
         return;
     }
     serial_puts("LOGS: найдено накопителей: ");
-    ls_pn("", ncand, "; запись пойдёт на тот, где есть раздел LOGS\n");
+    ls_pn("", ncand, "; автоматический режим ищет раздел с меткой LOGS\n");
 
-    /* 2. КАЖДЫЙ кандидат: модель/ёмкость → поиск раздела LOGS.
-     *    Первый без раздела LOGS (например, загрузочная флешка) честно
-     *    пропускается — проверяется СЛЕДУЮЩИЙ (проблема 1 ревью). */
+    /* 2. Для фонового sticklog по-прежнему требуется явная метка LOGS:
+     *    без интерактивного выбора нельзя автоматически писать в любой том. */
     int chosen = -1;
     for (int c = 0; c < ncand; c++) {
         g_ls_tr      = cand[c].tr;
@@ -1062,15 +1368,14 @@ void ls_stick_prepare(uint32_t cap_bytes) {
         serial_puts("', ");
         ls_pn("", g_ls_cap_sect, " секторов (");
         ls_pn("", g_ls_cap_sect / 2048u, " МБ)\n");
-        if (ls_find_logs_part()) { chosen = c; break; }
-        serial_puts("LOGS: на этом носителе раздела LOGS нет - проверяю следующий\n");
+        if (ls_find_fat32_part(true) == 1) { chosen = c; break; }
+        serial_puts("LOGS: безопасный FAT32-раздел не найден - проверяю следующий\n");
     }
     if (chosen < 0) {
         g_ls_tr = LS_TR_NONE;
-        serial_puts("LOGS: ИТОГ: раздел LOGS НЕ найден НИ НА ОДНОМ из ");
-        ls_pn("", ncand, " накопителей (нужен FAT32-раздел с\n");
-        serial_puts("LOGS: меткой тома 'LOGS'; подготовка - ТОЛЬКО вручную:\n");
-        serial_puts("LOGS: tools/mkstick.py для теста / форматирование в Windows).\n");
+        serial_puts("LOGS: ИТОГ: FAT32-раздел с меткой LOGS не найден на видимых носителях.\n");
+        serial_puts("LOGS: автоматическая запись отменена; используйте LOGWRITER\n");
+        serial_puts("LOGS: для интерактивного выбора любого FAT32-раздела или RAW.\n");
         serial_puts("LOGS: НИЧЕГО не записано - чужие разделы под защитой\n");
         ls_set_status("раздел LOGS не найден");
         g_ls_stage = 4;
@@ -1086,8 +1391,8 @@ void ls_stick_prepare(uint32_t cap_bytes) {
     serial_puts(" '");
     serial_puts(cand[chosen].name);
     serial_puts("', ");
-    ls_pn("", g_ls_cap_sect, " секторов - НА НЁМ раздел LOGS,\n");
-    serial_puts("LOGS: запись ТОЛЬКО в этот раздел (см. границы выше)\n");
+    ls_pn("", g_ls_cap_sect, " секторов - выбранный FAT32-раздел выше,\n");
+    serial_puts("LOGS: запись ТОЛЬКО в выбранный FAT32-раздел (см. границы выше)\n");
 
     /* 4. EGOROV.LOG: найти/создать/проверить */
     uint32_t rd_errs0 = g_ls_rd_errs;   /* до поиска: дельта = транспорт */
@@ -1106,6 +1411,7 @@ void ls_stick_prepare(uint32_t cap_bytes) {
         if (!ls_dir_create()) {
             ls_set_status("запись каталога не создана");
             g_part_start = g_part_end = 0;
+    g_part_guard_enabled = false;
             g_ls_stage = 4;
             return;
         }
@@ -1118,6 +1424,7 @@ void ls_stick_prepare(uint32_t cap_bytes) {
             ls_set_status("нет свободного слота в корне");
         }
         g_part_start = g_part_end = 0;
+    g_part_guard_enabled = false;
         g_ls_stage = 4;
         return;
     }
@@ -1184,7 +1491,7 @@ void ls_stick_prepare(uint32_t cap_bytes) {
     }
 
     g_ls_stage = 1;
-    ls_set_status("раздел LOGS готов, EGOROV.LOG открыт");
+    ls_set_status("FAT32-раздел готов, EGOROV.LOG открыт");
 }
 
 void ls_tick(void) {
@@ -1260,3 +1567,388 @@ void ls_flush_final(void) {
 const char *ls_status(void) { return g_ls_status; }
 
 bool ls_active(void) { return g_ls_stage == 1; }
+
+/* Read back the directory entry and every file byte after a manual export. */
+static bool lw_verify_file(const uint8_t *expected, uint32_t len) {
+    if (!expected || g_fat.fsize != len || g_dir_confirmed != len) return false;
+    if (!ls_rd(g_fat.dir_lba)) return false;
+    const uint8_t *e = g_sec + g_fat.dir_off;
+    if (!ls_eq11(e, LS_FILE_NAME)) return false;
+    uint32_t first = (((uint32_t)e[21] << 24) | ((uint32_t)e[20] << 16) |
+                      ((uint32_t)e[27] << 8) | e[26]);
+    uint32_t size = ls_rdb32(e + 28);
+    if (size != len || first != g_fat.first_clus) return false;
+    /* Invalidate the write-side FAT cache before verification. Otherwise a
+     * successful comparison could consult metadata still held in RAM rather
+     * than proving that the FAT chain is readable back from the USB medium. */
+    g_fat.fat_cache_lba = 0xFFFFFFFFu;
+    uint32_t chain_count = 0;
+    if (!ls_validate_chain_strict(first, size, &chain_count)) return false;
+    if (len == 0u) return first == 0u;
+
+    uint32_t cluster = first;
+    uint32_t compared = 0;
+    uint32_t cluster_bytes = (uint32_t)g_fat.spc * 512u;
+    uint32_t need = (len / cluster_bytes) + ((len % cluster_bytes) ? 1u : 0u);
+    for (uint32_t ci = 0; ci < need; ci++) {
+        if (cluster < 2u || cluster >= g_fat.clus_count) return false;
+        uint32_t base = ls_clus_lba(cluster);
+        for (uint32_t si = 0; si < g_fat.spc && compared < len; si++) {
+            if (!ls_rd(base + si)) return false;
+            uint32_t n = len - compared;
+            if (n > 512u) n = 512u;
+            for (uint32_t j = 0; j < n; j++)
+                if (g_sec[j] != expected[compared + j]) return false;
+            compared += n;
+        }
+        if (ci + 1u < need) {
+            uint32_t next;
+            if (!ls_fat_get_checked(cluster, &next) || next < 2u ||
+                next >= g_fat.clus_count || next >= LS_FAT_EOC) return false;
+            cluster = next;
+        }
+    }
+    return compared == len;
+}
+
+static bool lw_validate_device(int transport, uint32_t expected_sectors,
+                               const char *expected_name, char *result,
+                               uint32_t result_capacity) {
+    ls_cand_t cand[LOGWRITER_MAX_DEVICES];
+    int ncand = ls_blk_enumerate(cand, LOGWRITER_MAX_DEVICES);
+    int found = -1;
+    for (int i = 0; i < ncand; i++)
+        if (cand[i].tr == transport) { found = i; break; }
+    if (found < 0 || cand[found].cap == 0u) {
+        lw_copy_text(result, result_capacity, "Выбранный USB-накопитель больше не доступен.");
+        return false;
+    }
+    if (cand[found].cap != expected_sectors || !expected_name ||
+        strcmp(cand[found].name, expected_name) != 0) {
+        lw_copy_text(result, result_capacity, "USB-устройство изменилось. Обновите список и выберите флешку снова.");
+        return false;
+    }
+    g_ls_tr = cand[found].tr;
+    g_ls_cap_sect = cand[found].cap;
+    return true;
+}
+
+static bool lw_capture_snapshot(uint32_t *out_len, char *result,
+                                uint32_t result_capacity) {
+    uint32_t total = klog_total();
+    uint32_t early = klog_early_len();
+    uint32_t oldest = klog_oldest();
+    if (total == 0u || total > LOGWRITER_SNAPSHOT_MAX || early > total ||
+        early > LOGWRITER_SNAPSHOT_MAX) {
+        lw_copy_text(result, result_capacity, "Снимок журнала пуст или превышает буфер 192 КиБ.");
+        return false;
+    }
+    if (early < oldest) {
+        lw_copy_text(result, result_capacity, "Журнал уже переполнен: полный снимок восстановить нельзя.");
+        return false;
+    }
+    uint32_t copied = 0;
+    if (early) copied = klog_early_copy(0u, (char *)g_logwriter_snapshot, early);
+    if (copied != early) {
+        lw_copy_text(result, result_capacity, "Не удалось скопировать раннюю часть журнала.");
+        return false;
+    }
+    uint32_t tail_len = total - early;
+    if (tail_len) {
+        uint32_t tail_copied = klog_snapshot(early,
+            (char *)g_logwriter_snapshot + early, tail_len);
+        if (tail_copied != tail_len) {
+            lw_copy_text(result, result_capacity, "Кольцо журнала изменилось или содержит потерянные байты.");
+            return false;
+        }
+    }
+    if (klog_total() != total) {
+        lw_copy_text(result, result_capacity, "Журнал изменился во время снимка; повторите команду.");
+        return false;
+    }
+    *out_len = total;
+    return true;
+}
+
+static uint32_t lw_crc32(const uint8_t *data, uint32_t len) {
+    return ~ls_crc32_update(0xFFFFFFFFu, data, len);
+}
+
+static void lw_put32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    p[3] = (uint8_t)(v >> 24);
+}
+
+static uint32_t lw_get32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/* Explicit RAW export only. The UI requires a second confirmation.
+ * LBA 0 receives EGORAW1; following sectors contain the frozen log snapshot.
+ * This destroys the partition table and may make existing data inaccessible. */
+static bool lw_raw_write_sector(uint32_t lba, uint32_t allowed_sectors) {
+    if (lba >= allowed_sectors || lba >= g_ls_cap_sect || g_ls_tr == LS_TR_NONE)
+        return false;
+    bool ok = false;
+    switch (g_ls_tr) {
+    case LS_TR_UHCI: ok = usb_write_sector(lba, g_sec); break;
+    case LS_TR_OHCI: ok = mouse_hw_msd_write(lba, g_sec); break;
+    case LS_TR_XHCI: ok = mouse_hw_xhci_msd_write(lba, g_sec); break;
+    default: return false;
+    }
+    if (ok) g_ls_io_sect++;
+    else g_ls_wr_errs++;
+    return ok;
+}
+
+static bool lw_raw_read_sector(uint32_t lba, uint32_t allowed_sectors) {
+    return lba < allowed_sectors && lba < g_ls_cap_sect && ls_rd(lba);
+}
+
+int logwriter_export(int transport, uint32_t expected_sectors,
+                      const char *expected_name, uint32_t *bytes_written,
+                      char *result, uint32_t result_capacity) {
+    if (bytes_written) *bytes_written = 0;
+    if (result && result_capacity) result[0] = 0;
+    if (!result || result_capacity == 0) return LOGWRITER_EXPORT_FAIL;
+    if (g_ls_stage == 1) {
+        lw_copy_text(result, result_capacity, "Автозапись журнала уже активна; остановите sticklog.");
+        return LOGWRITER_EXPORT_FAIL;
+    }
+
+    /* Re-check the physical device identity and freeze an immutable snapshot. */
+    if (!lw_validate_device(transport, expected_sectors, expected_name, result, result_capacity))
+        return LOGWRITER_EXPORT_FAIL;
+    uint32_t total = 0;
+    if (!lw_capture_snapshot(&total, result, result_capacity))
+        return LOGWRITER_EXPORT_FAIL;
+
+    /* Now the snapshot is immutable. Interactive LOGWRITER can use any
+     * validated non-boot FAT32 volume; automatic sticklog still requires
+     * the explicit LOGS label to avoid writing without user selection. */
+    /* Device and immutable snapshot were validated above. */
+    g_part_start = g_part_end = 0u;
+    g_part_guard_enabled = false;
+    g_ls_rd_errs = g_ls_wr_errs = g_ls_io_sect = 0u;
+    g_ls_bytes_in_file = g_ls_flushes = g_ls_fail_run = 0u;
+    g_alloc_cnt = g_no_space = g_meta_fail = g_dir_confirmed = 0u;
+    g_ls_stage = 0;
+    g_fat_scan_err = 0u;
+    g_fat.fat_cache_lba = 0xFFFFFFFFu;
+    serial_puts("\nLOGWRITER: ручной экспорт снимка журнала\n");
+    serial_puts("LOGWRITER: выбран транспорт "); serial_puts(ls_tr_name(g_ls_tr));
+    serial_puts("; файл будет записан и затем прочитан для побайтной проверки.\n");
+
+    int fat_status = ls_find_fat32_part(false);
+    if (fat_status != 1) {
+        g_ls_tr = LS_TR_NONE; g_ls_stage = 4;
+        if (fat_status == 0) {
+            lw_copy_text(result, result_capacity, "FAT32 не распознан. Можно выбрать RAW после отдельного подтверждения; это разрушит таблицу разделов.");
+            return LOGWRITER_EXPORT_RAW_REQUIRED;
+        }
+        if (fat_status == -2) {
+            lw_copy_text(result, result_capacity, "Раздел защищён или карта разделов недостоверна. RAW запрещён.");
+            return LOGWRITER_EXPORT_FAIL;
+        }
+        lw_copy_text(result, result_capacity, "Не удалось надёжно прочитать таблицу разделов/USB. RAW запрещён из-за ошибки чтения.");
+        return LOGWRITER_EXPORT_FAIL;
+    }
+
+    uint32_t errs_before = g_ls_rd_errs;
+    int f = ls_find_file();
+    if (f == 0) {
+        g_part_start = g_part_end = 0u;
+    g_part_guard_enabled = false; g_ls_stage = 4;
+        lw_copy_text(result, result_capacity, (g_ls_rd_errs != errs_before) ?
+            "Не удалось прочитать корневой каталог; запись отменена." :
+            "В корневом каталоге нет свободного места для EGOROV.LOG.");
+        return LOGWRITER_EXPORT_FAIL;
+    }
+    if (f == 1) {
+        if (!ls_truncate_existing_log()) {
+            g_part_start = g_part_end = 0u;
+    g_part_guard_enabled = false; g_ls_stage = 4;
+            lw_copy_text(result, result_capacity, "Существующий EGOROV.LOG не удалось безопасно очистить.");
+            return LOGWRITER_EXPORT_FAIL;
+        }
+    } else {
+        g_fat.first_clus = 0u; g_fat.last_clus = 0u; g_fat.fsize = 0u;
+        if (!ls_dir_create()) {
+            g_part_start = g_part_end = 0u;
+    g_part_guard_enabled = false; g_ls_stage = 4;
+            lw_copy_text(result, result_capacity, "Не удалось создать запись EGOROV.LOG в каталоге.");
+            return LOGWRITER_EXPORT_FAIL;
+        }
+        g_dir_confirmed = 0u;
+    }
+
+    if (total > g_ls_cap || ls_append(g_logwriter_snapshot, total) != total ||
+        g_meta_fail || g_no_space || g_fat.fsize != total || g_dir_confirmed != total) {
+        g_ls_stage = 4;
+        lw_copy_text(result, result_capacity, "Запись неполная: ошибка транспорта, нехватка места или метаданных FAT32.");
+        return LOGWRITER_EXPORT_FAIL;
+    }
+
+    serial_puts("LOGWRITER: проверяю длину файла, каталог, FAT-цепочку и содержимое...\n");
+    if (!lw_verify_file(g_logwriter_snapshot, total)) {
+        g_ls_stage = 4;
+        lw_copy_text(result, result_capacity, "Файл записан, но проверка чтением не совпала с исходным снимком.");
+        return LOGWRITER_EXPORT_FAIL;
+    }
+
+    g_ls_stage = 4; /* do not enable background continuous logging */
+    if (bytes_written) *bytes_written = total;
+    lw_copy_text(result, result_capacity, "Успешно: EGOROV.LOG прочитан обратно; каждый байт совпадает со снимком журнала.");
+    serial_puts("LOGWRITER: УСПЕХ: EGOROV.LOG побайтно совпадает со снимком (байт: ");
+    ls_pn("", total, ").\n");
+    return LOGWRITER_EXPORT_OK;
+}
+
+
+int logwriter_export_raw(int transport, uint32_t expected_sectors,
+                         const char *expected_name, uint32_t *bytes_written,
+                         char *result, uint32_t result_capacity) {
+    if (bytes_written) *bytes_written = 0u;
+    if (!result || result_capacity == 0u) return LOGWRITER_EXPORT_FAIL;
+    result[0] = 0;
+    if (g_ls_stage == 1) {
+        lw_copy_text(result, result_capacity, "Автозапись журнала уже активна; сначала остановите sticklog.");
+        return LOGWRITER_EXPORT_FAIL;
+    }
+    if (!lw_validate_device(transport, expected_sectors, expected_name, result, result_capacity))
+        return LOGWRITER_EXPORT_FAIL;
+
+    /* Refuse RAW if a safe FAT32 data partition is actually readable. */
+    g_ls_rd_errs = g_ls_wr_errs = g_ls_io_sect = 0u;
+    g_part_start = g_part_end = 0u;
+    g_part_guard_enabled = false;
+    g_fat.fat_cache_lba = 0xFFFFFFFFu;
+    int fat_status = ls_find_fat32_part(false);
+    if (fat_status == 1) {
+        lw_copy_text(result, result_capacity, "На выбранном диске найден FAT32. RAW отменён; используйте обычную запись.");
+        g_part_start = g_part_end = 0u;
+    g_part_guard_enabled = false;
+        return LOGWRITER_EXPORT_FAIL;
+    }
+    if (fat_status == -2) {
+        lw_copy_text(result, result_capacity, "Раздел защищён или карта разделов недостоверна. RAW запрещён.");
+        g_part_start = g_part_end = 0u;
+    g_part_guard_enabled = false;
+        return LOGWRITER_EXPORT_FAIL;
+    }
+    if (fat_status < 0) {
+        lw_copy_text(result, result_capacity, "Ошибка чтения разделов. RAW отменён ради безопасности.");
+        g_part_start = g_part_end = 0u;
+    g_part_guard_enabled = false;
+        return LOGWRITER_EXPORT_FAIL;
+    }
+
+    uint32_t total = 0u;
+    if (!lw_capture_snapshot(&total, result, result_capacity)) return LOGWRITER_EXPORT_FAIL;
+    if (total > 0xFFFFFFFFu - 511u) {
+        lw_copy_text(result, result_capacity, "Снимок слишком велик для RAW-формата.");
+        return LOGWRITER_EXPORT_FAIL;
+    }
+    uint32_t payload_sectors = (total + 511u) / 512u;
+    if (payload_sectors > 0xFFFFFFFFu - 1u) {
+        lw_copy_text(result, result_capacity, "Переполнение расчёта размера RAW-записи.");
+        return LOGWRITER_EXPORT_FAIL;
+    }
+    uint32_t needed = 1u + payload_sectors;
+    if (expected_sectors < needed || needed == 0u) {
+        lw_copy_text(result, result_capacity, "Флешка слишком мала для RAW-журнала.");
+        return LOGWRITER_EXPORT_FAIL;
+    }
+
+    serial_puts("LOGWRITER RAW: ВНИМАНИЕ: записываю LBA 0 и следующие сектора.");
+    serial_puts(" Таблица разделов и доступ к существующим данным будут потеряны.\n");
+    serial_puts("LOGWRITER RAW: байт журнала: "); ls_pn("", total, "; секторов для записи: ");
+    ls_pn("", needed, "\n");
+
+    uint8_t expected_header[512];
+    memset(expected_header, 0, sizeof(expected_header));
+    memcpy(expected_header, "EGORAW1", 7);
+    lw_put32(expected_header + 8, 1u);                 /* format version */
+    lw_put32(expected_header + 12, 80u);               /* header bytes */
+    lw_put32(expected_header + 16, total);             /* payload length */
+    lw_put32(expected_header + 20, lw_crc32(g_logwriter_snapshot, total));
+    lw_put32(expected_header + 24, needed);            /* total sectors */
+    lw_put32(expected_header + 28, lw_crc32(expected_header, 28u));
+    memcpy(expected_header + 32, "Egorov OS raw journal; payload at LBA 1", 39);
+
+    g_ls_stage = 0;
+    g_ls_bytes_in_file = 0u;
+    g_part_start = g_part_end = 0u;
+    g_part_guard_enabled = false; /* FAT guard is intentionally not used in explicitly confirmed RAW mode. */
+    memcpy(g_sec, expected_header, sizeof(expected_header));
+    if (!lw_raw_write_sector(0u, needed)) {
+        lw_copy_text(result, result_capacity, "RAW: ошибка записи заголовка в LBA 0. Разметка могла быть повреждена.");
+        g_ls_stage = 4;
+        return LOGWRITER_EXPORT_FAIL;
+    }
+
+    uint32_t offset = 0u;
+    for (uint32_t si = 0u; si < payload_sectors; si++) {
+        memset(g_sec, 0, 512u);
+        uint32_t n = total - offset;
+        if (n > 512u) n = 512u;
+        memcpy(g_sec, g_logwriter_snapshot + offset, n);
+        if (!lw_raw_write_sector(1u + si, needed)) {
+            lw_copy_text(result, result_capacity, "RAW: ошибка записи данных. Разметка диска повреждена; не повторяйте без проверки.");
+            g_ls_stage = 4;
+            return LOGWRITER_EXPORT_FAIL;
+        }
+        offset += n;
+    }
+
+    /* Read back the raw header and payload from the selected medium. */
+    if (!lw_raw_read_sector(0u, needed) ||
+        memcmp(g_sec, expected_header, sizeof(expected_header)) != 0) {
+        lw_copy_text(result, result_capacity, "RAW: заголовок не совпал при чтении обратно.");
+        g_ls_stage = 4;
+        return LOGWRITER_EXPORT_FAIL;
+    }
+    offset = 0u;
+    for (uint32_t si = 0u; si < payload_sectors; si++) {
+        if (!lw_raw_read_sector(1u + si, needed)) {
+            lw_copy_text(result, result_capacity, "RAW: ошибка чтения данных при проверке.");
+            g_ls_stage = 4;
+            return LOGWRITER_EXPORT_FAIL;
+        }
+        uint32_t n = total - offset;
+        if (n > 512u) n = 512u;
+        for (uint32_t j = 0u; j < n; j++) {
+            if (g_sec[j] != g_logwriter_snapshot[offset + j]) {
+                lw_copy_text(result, result_capacity, "RAW: содержимое не совпало при побайтной проверке.");
+                g_ls_stage = 4;
+                return LOGWRITER_EXPORT_FAIL;
+            }
+        }
+        for (uint32_t j = n; j < 512u; j++) {
+            if (g_sec[j] != 0u) {
+                lw_copy_text(result, result_capacity, "RAW: выравнивающие байты не совпали при проверке.");
+                g_ls_stage = 4;
+                return LOGWRITER_EXPORT_FAIL;
+            }
+        }
+        offset += n;
+    }
+    /* Revalidate payload checksum using the same frozen snapshot. */
+    if (lw_crc32(g_logwriter_snapshot, total) != lw_get32(expected_header + 20u) ||
+        lw_crc32(expected_header, 28u) != lw_get32(expected_header + 28u)) {
+        lw_copy_text(result, result_capacity, "RAW: контрольная сумма заголовка/журнала ошибочна.");
+        g_ls_stage = 4;
+        return LOGWRITER_EXPORT_FAIL;
+    }
+
+    g_ls_stage = 4;
+    if (bytes_written) *bytes_written = total;
+    lw_copy_text(result, result_capacity,
+        "RAW УСПЕХ: байты сверены. Диск не будет виден как FAT32; извлеките лог RAW-экстрактором.");
+    serial_puts("LOGWRITER RAW: УСПЕХ: побайтная проверка пройдена, байт: ");
+    ls_pn("", total, "\n");
+    return LOGWRITER_EXPORT_OK;
+}
