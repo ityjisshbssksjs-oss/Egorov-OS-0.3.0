@@ -1,4 +1,4 @@
-# Egorov OS 0.3.0 - kernel + ISO build
+# Egorov OS 0.3.1 - kernel + ISO build
 # Pipeline: kernel objects -> stage1 ELF -> flat egorov.bin -> embed.o -> egorov.kernel -> ISO
 # Run `make` to build; `make clean` removes all build artefacts.
 
@@ -36,14 +36,14 @@ CFLAGS  := -m32 -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
 	-fno-strict-aliasing \
 	-fno-tree-loop-distribute-patterns \
 	-fno-optimize-sibling-calls \
-	-Ikernel \
+	-Ikernel -Isystem_programs \
 	-std=gnu99 \
 	$(REGS_ONLY)
 
 # [#480] ЭТАП 10: ЗАВИСИМОСТИ ОТ ЗАГОЛОВКОВ. Прежние правила
 # «%.o: %.c $(FONT)» не зависели НИ ОТ ОДНОГО .h: правка kernel/version.h
 # (номер СБОРКИ!) не пересобирала kernel.o/mouse_hw.o — в свежем образе
-# оставался СТАРЫЙ баннер «Сборка 1», и по флешке нельзя было понять,
+# оставался СТАРЫЙ баннер с прежним номером сборки, и по флешке нельзя было понять,
 # записался ли новый релиз (сам сценарий из [#473] ломался молча).
 # -MMD -MP пишет .d рядом с .o; строки -include внизу подключают их.
 DEPFLAGS := -MMD -MP
@@ -65,6 +65,8 @@ KERNEL_C := \
 	kernel/installer.c \
 	kernel/ps2.c \
 	kernel/ata.c \
+	kernel/blockdev.c \
+	kernel/vfs.c \
 	kernel/ahci.c \
 	kernel/usb.c \
 	kernel/usb_mouse.c \
@@ -73,21 +75,23 @@ KERNEL_C := \
 	kernel/uhci_kbd.c \
 	kernel/usb_uhci_kbd.c \
 	kernel/ehci.c \
+	kernel/usbdump.c \
 	kernel/usb_kbd.c \
 	kernel/usbmap.c \
 	kernel/usbdev.c \
 	kernel/logstick.c \
+	system_programs/logwriter_ui.c \
 	kernel/mouse_hw.c \
 	kernel/rtc.c \
-	kernel/calc.c \
-	kernel/clock_app.c \
-	kernel/paint.c \
-	kernel/explorer.c \
-	kernel/notepad.c \
-	kernel/sysinfo.c \
-	kernel/snake.c \
-	kernel/exe_runner.c \
-	kernel/terminal.c
+	system_programs/calc.c \
+	system_programs/clock_app.c \
+	system_programs/paint.c \
+	system_programs/explorer.c \
+	system_programs/notepad.c \
+	system_programs/sysinfo.c \
+	system_programs/snake.c \
+	system_programs/exe_runner.c \
+	system_programs/terminal.c
 
 # boot/boot.S MUST come first so that _start is the very first symbol in
 # .text (= 0x101000).  The HDD bootloader hard-codes that jump address.
@@ -189,11 +193,22 @@ $(ISO): $(KERNEL) boot/grub.cfg
 	break; \
 	fi; \
 	done; true
+	@mkdir -p "$(BUILD)/iso/System Programs"; cp -R system_programs/. "$(BUILD)/iso/System Programs/"
 	$(GRUB) -o $(ISO) $(BUILD)/iso
 
 # ─── QEMU targets (require qemu-system-i386) ─────────────────────────────────
 run: $(ISO)
 	qemu-system-i386 -cdrom $(ISO) -m 128 -vga std
+
+# Capture the complete COM1 debug stream into a host file.  This does not
+# require a physical serial port; QEMU writes build/egorov-serial.log.
+# Logs are useful even when the guest's USB logging destination is missing.
+run-serial-log: $(ISO)
+	@mkdir -p $(BUILD)
+	@rm -f $(BUILD)/egorov-serial.log
+	qemu-system-i386 -cdrom $(ISO) -m 128 -vga std \
+		-serial file:$(BUILD)/egorov-serial.log
+	@echo "Serial log: $(BUILD)/egorov-serial.log"
 run-usbmouse: $(ISO)
 	qemu-system-i386 -cdrom $(ISO) -m 128 -vga std -usb -device usb-mouse \
 	-serial stdio 2>&1 | tee qemu.log
@@ -321,12 +336,13 @@ clean:
 
 # [#480] подключить автозависимости (.d пишутся компилятором рядом с .o)
 KERNEL_DEPS := $(wildcard $(BUILD)/kernel/*.d)
+PROGRAM_DEPS := $(wildcard $(BUILD)/system_programs/*.d)
 BOOT_DEPS   := $(wildcard $(BUILD)/boot/*.d)
-ifneq ($(words $(KERNEL_DEPS) $(BOOT_DEPS)),0)
-  -include $(KERNEL_DEPS) $(BOOT_DEPS)
+ifneq ($(words $(KERNEL_DEPS) $(PROGRAM_DEPS) $(BOOT_DEPS)),0)
+  -include $(KERNEL_DEPS) $(PROGRAM_DEPS) $(BOOT_DEPS)
 endif
 
-.PHONY: all clean run run-usbmouse run-usbtablet run-ohci-mouse run-xhci run-xhci-tablet run-sticklog run-sticklog-ohci run-sticklog-uhci run-install run-hdd run-uhci-kbd run-uhci-kbd-mouse run2-kernel run2-uhci-kbd-mouse run2-usb20 run3-usb1-both run3-usb2-both run3-usb3-both run3-usb3-two-ctrl run3-mixed run3-ohci run3-unknown run3-hotplug run3-k3m2 run3-k2m3
+.PHONY: all clean test-vfs run run-serial-log run-usbmouse run-usbtablet run-ohci-mouse run-xhci run-xhci-tablet run-sticklog run-sticklog-ohci run-sticklog-uhci run-install run-hdd run-uhci-kbd run-uhci-kbd-mouse run2-kernel run2-uhci-kbd-mouse run2-usb20 run3-usb1-both run3-usb2-both run3-usb3-both run3-usb3-two-ctrl run3-mixed run3-ohci run3-unknown run3-hotplug run3-k3m2 run3-k2m3
 
 # ═══ 0.3.0: тесты диспетчера usbdev (шесть драйверов + реестр + 1 Гц опрос) ═══
 # KQ3 = запуск с serial-логом в файл (без окна)
@@ -399,3 +415,12 @@ run3-hotplug: $(BUILD)/egorov.stage1
 	sleep 3; echo "device_del mm" | socat - unix-connect:/tmp/q3mon.sock; \
 	sleep 3; echo "device_add usb-mouse,id=mm,port=2" | socat - unix-connect:/tmp/q3mon.sock; \
 	sleep 4; pkill -f egorov.stage1; echo "лог: q3_t8_hotplug.log"
+
+# Host-side VFS regression test. Operates only on a synthetic in-memory disk.
+VFS_HOST_TEST := build/tests/vfs_host_test
+$(VFS_HOST_TEST): tests/vfs_host_test.c kernel/vfs.c kernel/vfs.h kernel/blockdev.h kernel/string.c kernel/string.h
+	@mkdir -p $(dir $@)
+	gcc -O2 -Wall -Wextra -fno-builtin -Ikernel tests/vfs_host_test.c kernel/vfs.c kernel/string.c -o $@
+
+test-vfs: $(VFS_HOST_TEST)
+	./$(VFS_HOST_TEST)
